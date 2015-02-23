@@ -133,6 +133,10 @@ func Init(tsdbhost *url.URL, root string) error {
 	return InitChan(tsdbhost, root, make(chan *opentsdb.DataPoint))
 }
 
+func SetHostname(host string) {
+	osHostname = host
+}
+
 func setHostName() error {
 	h, err := os.Hostname()
 	if err != nil {

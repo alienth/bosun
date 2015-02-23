@@ -155,6 +155,7 @@ func main() {
 	util.Set()
 	if *flagHostname != "" {
 		util.Hostname = *flagHostname
+		collect.SetHostname(*flagHostname)
 	}
 	if *flagColDir != "" {
 		collectors.InitPrograms(*flagColDir)
