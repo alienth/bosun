@@ -10,19 +10,29 @@ import (
 	"bosun.org/opentsdb"
 )
 
-func init() {
-	collectors = append(collectors, &IntervalCollector{F: c_windows_processes})
+func WatchProcesses(procs []string) error {
+	if len(procs) == 0 {
+		// if no processes configured in config file, use this set instead.
+		procs = []string{"chrome|powershell|scollector|SocketServer|WinRM|MSSQLSERVER|StackServerProd|StackServerDev|LogStasher"}
+	}
+	regexs := []*regexp.Regexp{}
+	for _, str := range procs {
+		reg, err := regexp.Compile(str)
+		if err != nil {
+			return err
+		}
+		regexs = append(regexs, reg)
+	}
+	collectors = append(collectors, &IntervalCollector{
+		F: func() (opentsdb.MultiDataPoint, error) {
+			return c_windows_processes(regexs)
+		},
+		name: "c_windows_processes",
+	})
+	return nil
 }
 
-func WatchProcesses(procs []*WatchedProc) error {
-	return fmt.Errorf("process watching not implemented on Darwin")
-}
-
-// These are silly processes but exist on my machine, will need to update KMB
-var processInclusions = regexp.MustCompile("chrome|powershell|scollector|SocketServer")
-var serviceInclusions = regexp.MustCompile("WinRM|MSSQLSERVER|StackServerProd|StackServerDev|LogStasher")
-
-func c_windows_processes() (opentsdb.MultiDataPoint, error) {
+func c_windows_processes(procs []*regexp.Regexp) (opentsdb.MultiDataPoint, error) {
 	var dst []Win32_PerfRawData_PerfProc_Process
 	var q = wmi.CreateQuery(&dst, `WHERE Name <> '_Total'`)
 	err := queryWmi(q, &dst)
@@ -64,7 +74,8 @@ func c_windows_processes() (opentsdb.MultiDataPoint, error) {
 		var name string
 		service_match := false
 		iis_match := false
-		process_match := processInclusions.MatchString(v.Name)
+
+		process_match := nameMatches(v.Name, procs)
 
 		id := "0"
 
@@ -82,7 +93,7 @@ func c_windows_processes() (opentsdb.MultiDataPoint, error) {
 
 		// A Service match could "overwrite" a process match, but that is probably what we would want
 		for _, svc := range svc_dst {
-			if serviceInclusions.MatchString(svc.Name) {
+			if nameMatches(svc.Name, procs) {
 				// It is possible the pid has gone and been reused, but I think this unlikely
 				// And I'm not aware of an atomic join we could do anyways
 				if svc.ProcessId != 0 && svc.ProcessId == v.IDProcess {
@@ -135,6 +146,15 @@ func c_windows_processes() (opentsdb.MultiDataPoint, error) {
 		Add(&md, "win.proc.thread_count", v.ThreadCount, opentsdb.TagSet{"name": name, "id": id}, metadata.Gauge, metadata.Count, descWinProcthread_count)
 	}
 	return md, nil
+}
+
+func nameMatches(name string, regexes []*regexp.Regexp) bool {
+	for _, r := range regexes {
+		if r.MatchString(name) {
+			return true
+		}
+	}
+	return false
 }
 
 // Divide CPU by 1e5 because: 1 seconds / 100 Nanoseconds = 1e7. This is the

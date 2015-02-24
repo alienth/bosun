@@ -51,7 +51,7 @@ var (
 	flagFreq            = flag.String("freq", "15", "Set the default frequency in seconds for most collectors.")
 	flagConf            = flag.String("conf", "", "Location of configuration file. Defaults to scollector.conf in directory of the scollector executable.")
 
-	procs []*collectors.WatchedProc
+	procs []string // List of processes to watch. Supplied by config file. Format varies between os's.
 
 	mains []func()
 )
@@ -115,11 +115,7 @@ func readConf() {
 		case "freq":
 			f(flagFreq)
 		case "process":
-			p, err := collectors.NewWatchedProc(v)
-			if err != nil {
-				slog.Fatal(err)
-			}
-			procs = append(procs, p)
+			procs = append(procs, v)
 		case "keepalived_community":
 			collectors.KeepAliveCommunity = v
 		default:
@@ -193,10 +189,9 @@ func main() {
 			collectors.Vsphere(user, pwd, host)
 		}
 	}
-	if len(procs) > 0 {
-		if err := collectors.WatchProcesses(procs); err != nil {
-			log.Fatal(err)
-		}
+	// Start all process collectors. This is platform specific.
+	if err := collectors.WatchProcesses(procs); err != nil {
+		log.Fatal(err)
 	}
 	if *flagFake > 0 {
 		collectors.InitFake(*flagFake)
