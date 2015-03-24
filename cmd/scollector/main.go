@@ -51,6 +51,7 @@ var (
 	flagFreq            = flag.String("freq", "15", "Set the default frequency in seconds for most collectors.")
 	flagConf            = flag.String("conf", "", "Location of configuration file. Defaults to scollector.conf in directory of the scollector executable.")
 	flagAWS             = flag.String("aws", "", `AWS keys and region, format: "access_key:secret_key@region".`)
+	flagGAcreds         = flag.String("gacreds", "", `Google Analytics client id and client secret, format: "clientid:clientsecret".`)
 
 	mains []func()
 )
@@ -125,6 +126,12 @@ func readConf() {
 			}
 		case "keepalived_community":
 			collectors.KeepAliveCommunity = v
+                case "gacreds":
+                        f(flagGAcreds)
+		case "ga_site":
+			if err := collectors.AddGAConfig(v); err != nil {
+				slog.Fatal(err)
+			}
 		default:
 			slog.Fatalf("unknown key in %v:%v", loc, i+1)
 		}
@@ -216,6 +223,20 @@ func main() {
 				slog.Fatal("invalid vsphere string:", *flagVsphere)
 			}
 			collectors.Vsphere(user, pwd, host)
+		}
+	}
+	if *flagGAcreds != "" {
+		for _, s := range strings.Split(*flagGAcreds, ",") {
+			sp := strings.SplitN(s, ":", 2)
+			if len(sp) != 2 {
+				slog.Fatal("invalid ga string:", *flagGAcreds)
+			}
+			clientid := sp[0]
+			secret := sp[1]
+			if len(clientid) == 0 || len(secret) == 0 {
+				slog.Fatal("invalid ga string:", *flagGAcreds)
+			}
+			collectors.GA(clientid, secret)
 		}
 	}
 	// Add all process collectors. This is platform specific.
