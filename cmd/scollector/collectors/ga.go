@@ -42,21 +42,21 @@ func AddGAConfig(line string) error {
 
 func NewTrackedSite(site string) (*TrackedSite, error) {
 	sp := strings.Split(site, ":")
-        offset := 1
-        var err error
+	offset := 1
+	var err error
 	if len(sp) < 2 {
 		return nil, fmt.Errorf("ga_tracked_site requires at least two fields, ex: mysite.com:1234567")
 	}
-        if len(sp) == 3 {
-            offset, err = strconv.Atoi(sp[2])
-            if err != nil {
-                return nil, fmt.Errorf("ga_tracked_site format error. ex: mysite.com:1234567:8")
-            }
-        }
+	if len(sp) == 3 {
+		offset, err = strconv.Atoi(sp[2])
+		if err != nil {
+			return nil, fmt.Errorf("ga_tracked_site format error. ex: mysite.com:1234567:8")
+		}
+	}
 	return &TrackedSite{
 		Name:    sp[0],
 		Profile: "ga:" + sp[1],
-                Offset: offset,
+		Offset:  offset,
 	}, nil
 }
 
@@ -98,17 +98,20 @@ func c_ga(clientid string, secret string, sites []*TrackedSite) (opentsdb.MultiD
 
 	for _, site := range sites {
 		call := svc.Data.Realtime.Get(site.Profile, "rt:pageviews").Dimensions("rt:minutesAgo")
-		data, _ := call.Do()
-		time := time.Now().Add(time.Duration(-1 * site.Offset) * time.Minute).Unix()
+		data, err := call.Do()
+		if err != nil {
+			continue
+		}
+		time := time.Now().Add(time.Duration(-1*site.Offset) * time.Minute).Unix()
 		value := "0"
-                for _, v := range data.Rows {
-                    minute, _ := strconv.Atoi(v[0])
-                    count := v[1]
-                    if minute == site.Offset {
-                        value = count
-                        break
-                    }
-                }
+		for _, v := range data.Rows {
+			minute, _ := strconv.Atoi(v[0])
+			count := v[1]
+			if minute == site.Offset {
+				value = count
+				break
+			}
+		}
 		AddTS(&md, "ga.realtime.pageviews", time, value, opentsdb.TagSet{"site": site.Name}, metadata.Gauge, metadata.Count, "Number of pageviews tracked by GA in one minute")
 		fmt.Printf("Addts %s %s %s %s\n", site, "ga.realtime.pageviews", value, time)
 	}
