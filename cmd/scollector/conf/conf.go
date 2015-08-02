@@ -49,6 +49,9 @@ type Conf struct {
 	// namespace
 	ElasticIndexFilters []string
 	RabbitMQ            []RabbitMQ
+	RunitServices       []RunitServices
+	InitdServices       []InitdServices
+	SystemdServices     []SystemdServices
 }
 
 type HAProxy struct {
@@ -132,4 +135,19 @@ type RabbitMQ struct {
 type Github struct {
 	Repo  string
 	Token string
+}
+
+type RunitServices struct {
+	WhiteList string
+	BlackList string
+}
+
+type InitdServices struct {
+	WhiteList string
+	BlackList string
+}
+
+type SystemdServices struct {
+	WhiteList string
+	BlackList string
 }

@@ -1,2 +1,6 @@
 cmd/bosun/dev.conf
+*\.prof
+*\.exe
+*\.test
+cmd/scollector/scollector
 docs/.jekyll-metadata
