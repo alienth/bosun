@@ -10,6 +10,8 @@ import (
 	"strings"
 
 	"bosun.org/_third_party/github.com/dimamedvedev/pstree"
+	"bosun.org/cmd/scollector/conf"
+	"bosun.org/slog"
 	"bosun.org/util"
 
 	"bosun.org/opentsdb"
@@ -18,6 +20,29 @@ import (
 const (
 	runitServicesDir = "/etc/service"
 )
+
+func init() {
+	WatchServicesLinux = func(c *conf.Conf) {
+		var err error
+		check := func(e error) {
+			if e != nil {
+				err = e
+			}
+		}
+		for _, s := range c.RunitServices {
+			check(RunitServices(s.WhiteList, s.BlackList))
+		}
+		for _, s := range c.InitdServices {
+			check(InitdServices(s.WhiteList, s.BlackList))
+		}
+		for _, s := range c.SystemdServices {
+			check(SystemdServices(s.WhiteList, s.BlackList))
+		}
+		if err != nil {
+			slog.Fatal(err)
+		}
+	}
+}
 
 func RunitServices(whiteList, blackList string) error {
 	collectors = append(collectors,

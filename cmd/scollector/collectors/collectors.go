@@ -97,6 +97,7 @@ var (
 		return fmt.Errorf("process_dotnet watching not implemented on this platform")
 	}
 	WatchProcessesDotNet = func() {}
+	WatchServicesLinux   = func(*conf.Conf) {}
 
 	KeepalivedCommunity = ""
 )

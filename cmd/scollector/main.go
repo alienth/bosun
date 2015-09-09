@@ -134,15 +134,6 @@ func main() {
 	for _, r := range conf.Riak {
 		check(collectors.Riak(r.URL))
 	}
-	for _, s := range conf.RunitServices {
-		check(collectors.RunitServices(s.WhiteList, s.BlackList))
-	}
-	for _, s := range conf.InitdServices {
-		check(collectors.InitdServices(s.WhiteList, s.BlackList))
-	}
-	for _, s := range conf.SystemdServices {
-		check(collectors.SystemdServices(s.WhiteList, s.BlackList))
-	}
 	if err != nil {
 		slog.Fatal(err)
 	}
@@ -150,6 +141,7 @@ func main() {
 	// Add all process collectors. This is platform specific.
 	collectors.WatchProcesses()
 	collectors.WatchProcessesDotNet()
+	collectors.WatchServicesLinux(conf)
 
 	if *flagFake > 0 {
 		collectors.InitFake(*flagFake)
