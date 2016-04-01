@@ -7,10 +7,10 @@ import (
 	"strings"
 	"time"
 
-	"bosun.org/_third_party/github.com/StackExchange/wmi"
 	"bosun.org/metadata"
 	"bosun.org/opentsdb"
 	"bosun.org/slog"
+	"github.com/StackExchange/wmi"
 )
 
 func init() {
@@ -137,6 +137,7 @@ func c_network_windows() (opentsdb.MultiDataPoint, error) {
 		Add(&md, "win.net.dropped", nicStats.PacketsReceivedDiscarded, tagsIn, metadata.Counter, metadata.PerSecond, descWinNetPacketsReceivedDiscarded)
 		Add(&md, "win.net.errs", nicStats.PacketsOutboundErrors, tagsOut, metadata.Counter, metadata.PerSecond, descWinNetPacketsOutboundErrors)
 		Add(&md, "win.net.errs", nicStats.PacketsReceivedErrors, tagsIn, metadata.Counter, metadata.PerSecond, descWinNetPacketsReceivedErrors)
+		Add(&md, osNetIfSpeed, nicStats.CurrentBandwidth/1000000, opentsdb.TagSet{"iface": iface}, metadata.Gauge, metadata.Megabit, osNetIfSpeedDesc)
 		Add(&md, osNetBytes, nicStats.BytesReceivedPersec, tagsIn, metadata.Counter, metadata.BytesPerSecond, osNetBytesDesc)
 		Add(&md, osNetBytes, nicStats.BytesSentPersec, tagsOut, metadata.Counter, metadata.BytesPerSecond, osNetBytesDesc)
 		Add(&md, osNetPackets, nicStats.PacketsReceivedPersec, tagsIn, metadata.Counter, metadata.PerSecond, osNetPacketsDesc)
@@ -176,16 +177,16 @@ type Win32_NetworkAdapter struct {
 }
 
 type Win32_PerfRawData_Tcpip_NetworkInterface struct {
-	CurrentBandwidth         uint32
-	BytesReceivedPersec      uint32
-	BytesSentPersec          uint32
+	CurrentBandwidth         uint64
+	BytesReceivedPersec      uint64
+	BytesSentPersec          uint64
 	Name                     string
-	PacketsOutboundDiscarded uint32
-	PacketsOutboundErrors    uint32
-	PacketsReceivedDiscarded uint32
-	PacketsReceivedErrors    uint32
-	PacketsReceivedPersec    uint32
-	PacketsSentPersec        uint32
+	PacketsOutboundDiscarded uint64
+	PacketsOutboundErrors    uint64
+	PacketsReceivedDiscarded uint64
+	PacketsReceivedErrors    uint64
+	PacketsReceivedPersec    uint64
+	PacketsSentPersec        uint64
 }
 
 // c_network_team_windows will add metrics for team network adapters from
@@ -329,10 +330,10 @@ func c_network_windows_tcp() (opentsdb.MultiDataPoint, error) {
 	}
 	var md opentsdb.MultiDataPoint
 	for _, v := range dst {
-		Add(&md, "win.net.tcp.failures", v.ConnectionFailures, nil, metadata.Gauge, metadata.Connection, descWinNetTCPv4ConnectionFailures)
-		Add(&md, "win.net.tcp.active", v.ConnectionsActive, nil, metadata.Gauge, metadata.Connection, descWinNetTCPv4ConnectionsActive)
+		Add(&md, "win.net.tcp.failures", v.ConnectionFailures, nil, metadata.Counter, metadata.Connection, descWinNetTCPv4ConnectionFailures)
+		Add(&md, "win.net.tcp.active", v.ConnectionsActive, nil, metadata.Counter, metadata.Connection, descWinNetTCPv4ConnectionsActive)
 		Add(&md, "win.net.tcp.established", v.ConnectionsEstablished, nil, metadata.Gauge, metadata.Connection, descWinNetTCPv4ConnectionsEstablished)
-		Add(&md, "win.net.tcp.passive", v.ConnectionsPassive, nil, metadata.Gauge, metadata.Connection, descWinNetTCPv4ConnectionsPassive)
+		Add(&md, "win.net.tcp.passive", v.ConnectionsPassive, nil, metadata.Counter, metadata.Connection, descWinNetTCPv4ConnectionsPassive)
 		Add(&md, "win.net.tcp.reset", v.ConnectionsReset, nil, metadata.Gauge, metadata.Connection, descWinNetTCPv4ConnectionsReset)
 		Add(&md, "win.net.tcp.segments", v.SegmentsReceivedPersec, opentsdb.TagSet{"type": "received"}, metadata.Counter, metadata.PerSecond, descWinNetTCPv4SegmentsReceivedPersec)
 		Add(&md, "win.net.tcp.segments", v.SegmentsRetransmittedPersec, opentsdb.TagSet{"type": "retransmitted"}, metadata.Counter, metadata.PerSecond, descWinNetTCPv4SegmentsRetransmittedPersec)

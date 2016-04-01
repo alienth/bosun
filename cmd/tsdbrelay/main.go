@@ -16,6 +16,8 @@ import (
 	"strings"
 
 	"bosun.org/cmd/tsdbrelay/denormalize"
+	"bosun.org/collect"
+	"bosun.org/metadata"
 	"bosun.org/opentsdb"
 	"bosun.org/util"
 )
@@ -27,6 +29,9 @@ var (
 	tsdbServer      = flag.String("t", "", "Target OpenTSDB server. Can specify port with host:port.")
 	logVerbose      = flag.Bool("v", false, "enable verbose logging")
 	toDenormalize   = flag.String("denormalize", "", "List of metrics to denormalize. Comma seperated list of `metric__tagname__tagname` rules. Will be translated to `__tagvalue.tagvalue.metric`")
+
+	redisHost = flag.String("redis", "", "redis host for aggregating external counters")
+	redisDb   = flag.Int("db", 0, "redis db to use for counters")
 )
 
 var (
@@ -102,11 +107,28 @@ func main() {
 	http.HandleFunc("/api/put", func(w http.ResponseWriter, r *http.Request) {
 		rp.relayPut(w, r, true)
 	})
+	if *redisHost != "" {
+		http.HandleFunc("/api/count", collect.HandleCounterPut(*redisHost, *redisDb))
+	}
 	http.HandleFunc("/api/metadata/put", func(w http.ResponseWriter, r *http.Request) {
 		rp.relayMetadata(w, r)
 	})
 	http.Handle("/", tsdbProxy)
+
+	collectUrl := &url.URL{
+		Scheme: "http",
+		Host:   *listenAddr,
+		Path:   "/api/put",
+	}
+	if err = collect.Init(collectUrl, "tsdbrelay"); err != nil {
+		log.Fatal(err)
+	}
 	log.Fatal(http.ListenAndServe(*listenAddr, nil))
+}
+
+func init() {
+	metadata.AddMetricMeta("tsdbrelay.puts.relayed", metadata.Counter, metadata.Count, "Number of successful puts relayed")
+	metadata.AddMetricMeta("tsdbrelay.metadata.relayed", metadata.Counter, metadata.Count, "Number of successful metadata puts relayed")
 }
 
 func verbose(format string, a ...interface{}) {
@@ -152,11 +174,12 @@ func (rp *relayProxy) relayPut(responseWriter http.ResponseWriter, r *http.Reque
 	r.Body = reader
 	w := &relayWriter{ResponseWriter: responseWriter}
 	rp.TSDBProxy.ServeHTTP(w, r)
-	if w.code != 204 {
-		verbose("got status", w.code)
+	if w.code/100 != 2 {
+		verbose("got status %d", w.code)
 		return
 	}
 	verbose("relayed to tsdb")
+	collect.Add("puts.relayed", opentsdb.TagSet{}, 1)
 	// Send to bosun in a separate go routine so we can end the source's request.
 	go func() {
 		body := bytes.NewBuffer(reader.buf.Bytes())
@@ -255,16 +278,16 @@ func (rp *relayProxy) denormalize(body io.Reader) {
 }
 
 func (rp *relayProxy) relayMetadata(responseWriter http.ResponseWriter, r *http.Request) {
-
 	reader := &passthru{ReadCloser: r.Body}
 	r.Body = reader
 	w := &relayWriter{ResponseWriter: responseWriter}
 	rp.BosunProxy.ServeHTTP(w, r)
 	if w.code != 204 {
-		verbose("got status", w.code)
+		verbose("got status %d", w.code)
 		return
 	}
 	verbose("relayed metadata to bosun")
+	collect.Add("metadata.relayed", opentsdb.TagSet{}, 1)
 	if r.Header.Get(relayHeader) != "" {
 		return
 	}
@@ -279,7 +302,6 @@ func (rp *relayProxy) relayMetadata(responseWriter http.ResponseWriter, r *http.
 					return
 				}
 				req.Header.Set("Content-Type", "application/json")
-				req.Header.Set("Content-Encoding", "gzip")
 				req.Header.Add(relayHeader, myHost)
 				resp, err := http.DefaultClient.Do(req)
 				if err != nil {

@@ -8,6 +8,7 @@ interface IExprScope extends RootScope {
 	set: () => void;
 	tab: string;
 	graph: any;
+	bar: any;
 	svg_url: string;
 	date: string;
 	time: string;
@@ -16,8 +17,8 @@ interface IExprScope extends RootScope {
 	stop: () => any;
 }
 
+
 bosunControllers.controller('ExprCtrl', ['$scope', '$http', '$location', '$route', function($scope: IExprScope, $http: ng.IHttpService, $location: ng.ILocationService, $route: ng.route.IRouteService) {
-	
 	var search = $location.search();
 	var current: string;
 	try {
@@ -40,13 +41,27 @@ bosunControllers.controller('ExprCtrl', ['$scope', '$http', '$location', '$route
 	$http.post('/api/expr?' +
 		'date=' + encodeURIComponent($scope.date) +
 		'&time=' + encodeURIComponent($scope.time),current)
-		.success((data) => {
+		.success((data: any) => {
 			$scope.result = data.Results;
 			$scope.queries = data.Queries;
 			$scope.result_type = data.Type;
 			if (data.Type == 'series') {
 				$scope.svg_url = '/api/egraph/' + btoa(current) + '.svg?now=' + Math.floor(Date.now() / 1000);
 				$scope.graph = toChart(data.Results);
+			}
+			if (data.Type == 'number') {
+				 angular.forEach(data.Results, (d) => {
+					var name = '{';
+					angular.forEach(d.Group, (tagv, tagk) => {
+							if (name.length > 1) {
+								 name += ',';
+							}
+							name += tagk + '=' + tagv;
+					});
+					name += '}';
+					d.name = name;
+				 });
+				$scope.bar = data.Results;
 			}
 			$scope.running = '';
 		})

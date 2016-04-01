@@ -1,5 +1,5 @@
 
-bosunApp.directive('tsAckGroup', ['$location', ($location: ng.ILocationService) => {
+bosunApp.directive('tsAckGroup', ['$location', '$timeout', ($location: ng.ILocationService, $timeout: ng.ITimeoutService) => {
 	return {
 		scope: {
 			ack: '=',
@@ -11,11 +11,18 @@ bosunApp.directive('tsAckGroup', ['$location', ($location: ng.ILocationService) 
 		link: (scope: any, elem: any, attrs: any) => {
 			scope.canAckSelected = scope.ack == 'Needs Acknowledgement';
 			scope.panelClass = scope.$parent.panelClass;
+			
 			scope.btoa = scope.$parent.btoa;
 			scope.encode = scope.$parent.encode;
 			scope.shown = {};
 			scope.collapse = (i: any) => {
 				scope.shown[i] = !scope.shown[i];
+				
+				if (scope.shown[i] && scope.groups[i].Children.length == 1){
+					$timeout(function(){
+						scope.$broadcast("onOpen", i);
+					}, 0);      
+				}
 			};
 			scope.click = ($event: any, idx: number) => {
 				scope.collapse(idx);
@@ -97,6 +104,8 @@ bosunApp.directive('tsState', ['$sce', '$http', function($sce: ng.ISCEService, $
 	return {
 		templateUrl: '/partials/alertstate.html',
 		link: function(scope: any, elem: any, attrs: any) {
+			var myIdx = attrs["tsGrp"];
+			scope.currentStatus = attrs["tsGrpstatus"]
 			scope.name = scope.child.AlertKey;
 			scope.state = scope.child.State;
 			scope.action = (type: string) => {
@@ -119,6 +128,11 @@ bosunApp.directive('tsState', ['$sce', '$http', function($sce: ng.ISCEService, $
 						});
 				}
 			};
+			scope.$on('onOpen', function(e,i) { 
+				if(i == myIdx){ 
+        			scope.toggle();
+				}        
+    		});
 			scope.zws = (v: string) => {
 				if (!v) {
 					return '';
@@ -126,10 +140,10 @@ bosunApp.directive('tsState', ['$sce', '$http', function($sce: ng.ISCEService, $
 				return v.replace(/([,{}()])/g, '$1\u200b');
 			};
 			scope.state.Touched = moment(scope.state.Touched).utc();
-			angular.forEach(scope.state.History, (v, k) => {
+			angular.forEach(scope.state.Events, (v, k) => {
 				v.Time = moment(v.Time).utc();
 			});
-			scope.state.last = scope.state.History[scope.state.History.length - 1];
+			scope.state.last = scope.state.Events[scope.state.Events.length - 1];
 			if (scope.state.Actions && scope.state.Actions.length > 0) {
 				scope.state.LastAction = scope.state.Actions[0];
 			}
@@ -167,5 +181,19 @@ bosunApp.directive('tsForget', () => {
 	return {
 		restrict: 'E',
 		templateUrl: '/partials/forget.html',
+	};
+});
+
+bosunApp.directive('tsPurge', () => {
+	return {
+		restrict: 'E',
+		templateUrl: '/partials/purge.html',
+	};
+});
+
+bosunApp.directive('tsForceClose', () => {
+	return {
+		restrict: 'E',
+		templateUrl: '/partials/forceClose.html',
 	};
 });

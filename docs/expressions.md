@@ -40,12 +40,16 @@ Various metrics can be combined by operators as long as one group is a subset of
 
 ## Operators
 
-The standard arithmetic (`+`, binary and unary `-`, `*`, `/`, `%`), relational (`<`, `>`, `==`, `!=`, `>=`, `<=`), and logical (`&&`, `||`, and unary `!`) operators are supported. The binary operators require the value on at least one side to be a scalar or NumberSet. Arrays will have the operator applied to each element. Examples:
+The standard arithmetic (`+`, binary and unary `-`, `*`, `/`, `%`), relational (`<`, `>`, `==`, `!=`, `>=`, `<=`), and logical (`&&`, `||`, and unary `!`) operators are supported. Examples:
 
 * `q("q") + 1`, which adds one to every element of the result of the query `"q"`
 * `-q("q")`, the negation of the results of the query
 * `5 > q("q")`, a series of numbers indicating whether each data point is more than five
 * `6 / 8`, the scalar value three-quarters
+
+### Series Operations
+
+If you combine two seriesSets with an operator (i.e. `q(..)` + `q(..)`), then operations are applied for each point in the series if there is a corresponding datapoint on the right hand side (RH). A corresponding datapoint is one which has the same timestamp (and normal group subset rules apply). If there is no corresponding datapoint on the left side, then the datapoint is dropped. This is a new feature as of 0.5.0.
 
 ### Precedence
 
@@ -144,17 +148,21 @@ influx("db", '''SELECT non_negative_derivative(mean(value)) FROM "os.cpu" GROUP 
 q("sum:2m-avg:rate{counter,,1}:os.cpu{host=*}", "30m", "")
 ```
 
-## Logstash Query Functions
+## Logstash Query Functions (Deprecated)
+
+The logstash query functions have been deprecated. Trying to create filters from a single parsed string turned out to be too limiting for people's requrements. **The logstash functions work only with pre v2 elastic, and the es functions work only with elastic v2 or later.**
 
 ### lscount(indexRoot string, keyString string, filterString string, bucketDuration string, startDuration string, endDuration string) seriesSet
 
-lscount returns the per second rate of matching log documents.
+lscount returns a time bucked count of matching log documents.
 
   * `indexRoot` is the root name of the index to hit, the format is expected to be `fmt.Sprintf("%s-%s", index_root, d.Format("2006.01.02"))`.
   * `keyString` creates groups (like tagsets) and can also filter those groups. It is the format of `"field:regex,field:regex..."` The `:regex` can be ommited.
   * `filterString` is an Elastic regexp query that can be applied to any field. It is in the same format as the keystring argument.
-  * `bucketDuration` is in the same format is an opentsdb duration, and is the size of buckets returned (i.e. counts for every 10 minutes). In the case of lscount, that number is normalized to a per second rate by dividing the result by the number of seconds in the duration.
+  * `bucketDuration` is in the same format is an opentsdb duration, and is the size of buckets returned (i.e. counts for every 10 minutes). 
   * `startDuration` and `endDuration` set the time window from now - see the OpenTSDB q() function for more details.
+
+**Note:** As of Bosun 0.5.0, the results are no longer normalized per second. This resulted in bad extrapolations, and confusing interactions with functions like `sum(lscount(...))`. The rate will now be per bucket. If you still want the results normalized to per second, you can divide the result by the number of seconds with: `lscount("logstash", "logsource,program:bosun", $bucketDuration, "10m", "") / d($bucketDuration)`
 
 For example:
 
@@ -174,6 +182,68 @@ lstat returns various summary stats per bucket for the specified `field`. The fi
   * As of January 15, 2015 - logstash functionality is new so these functions may change a fair amount based on experience using them in alerts.
   * Alerts using this information likely want to set ignoreUnknown, since only "groups" that appear in the time frame are in the results.
 
+## Elastic Query Functions
+
+Elasitc replaces the deprecated logstash (ls) functions. It only works with Elastic v2+. It is meant to be able to work with any elastic documents that have a time field and not just logstash. It introduces two new types to allow for greater flexibility in querying. The ESIndexer type generates index names to query (based on the date range). There are now different functions to generate indexers for people with different configurations. The ESQuery type is generates elastic queries so you can filter your results. By making these new types, new Indexers and Elastic queries can be added over time.
+
+You can view the generated JSON for queries on the expr page by bring up miniprofiler with Alt-P.
+
+### escount(indexRoot ESIndexer, keyString string, filter ESQuery, bucketDuration string, startDuration string, endDuration string) seriesSet
+
+escount returns a time bucked count of matching documents. It uses the keystring, indexRoot, interval, and durations to create an [elastic Date Histogram Aggregation](https://www.elastic.co/guide/en/elasticsearch/reference/current/search-aggregations-bucket-datehistogram-aggregation.html).
+
+  * `indexIndexer` will always be a function that returns an ESIndexer, such as `esdaily`.
+  * `keyString` is a csv separated list of fields. The fields will become tag keys, and the values returned for fields become the correspond tag values. For example `host,errorCode`. If an empty string is given, then the result set will have a single series and will have an empty tagset `{}`. These keys become terms filters for the date histogram.
+  * `filter` will be a funtion that returns an ESQuery. The queries further refine the results. The fields you filter on can match the fields in the keyString, but don't have too. If you don't want to filter you results, use `esall()` here.
+  * `bucketDuration` is an opentsdb duration string. It sets the the span of time to bucket the count of documents. For example, "1m" will give you the count of documents per minute.
+  * `startDuration` and `endDuration` set the time window from now - see the OpenTSDB q() function for more details.
+
+### esstat(indexRoot ESIndexer, keyString string, filter ESQuery, bucketDuration string, startDuration string, endDuration string) seriesSet
+
+estat returns various summary stats per bucket for the specified `field`. The field must be numeric in elastic. rStat can be one of `avg`, `min`, `max`, `sum`, `sum_of_squares`, `variance`, `std_deviation`. The rest of the fields behave the same as escount.
+
+## Elastic Index Functions
+
+### esdaily (timeField string, indexRoot string, layout string) ESIndexer
+
+esdaily is for elastic indexes that have a date name for each day. Based on the timeframe of the enclosing es function (i.e. esstat and escount) to generate which indexes should be included in the query. It gets all indexes and won't include indices that don't exist. The layout specifer uses's [Go's time specification format](https://golang.org/pkg/time/#Parse). The timeField is the name of the field in elastic that contains timestamps for the documents.
+
+### esindicies(timeField string, index string...) ESIndexer
+esindices takes one or more literal indicies for the enclosing query to use. It does not check for existance of the index, and passes back the elastic error if the index does not exist. The timeField is the name of the field in elastic that contains timestamps for the documents.
+
+### esls(indexRoot string) ESIndexer
+esls is a shortcut for esdaily("@timestamp", indexRoot+"-", "2006.01.02") and is for the default daily format that logstash creates.
+
+## Elastic Query Generating Functions (for filtering)
+
+### esall() ESQuery
+esall returns an elastic matchall query, use this when you don't want to filter any documents.
+
+### esregexp(field string, regexp string)
+esregexp creates an [elastic regexp query](https://www.elastic.co/guide/en/elasticsearch/reference/2.x/query-dsl-regexp-query.html) for the specified field.
+
+### esquery(field string, querystring string)
+esquery creates a [full-text elastic query string query](https://www.elastic.co/guide/en/elasticsearch/reference/2.x/query-dsl-query-string-query.html). 
+
+### esand(queries.. ESQuery) ESQuery
+esand takes one or more ESQueries and combines them into an [elastic bool query](https://www.elastic.co/guide/en/elasticsearch/reference/2.x/query-dsl-bool-query.html) where all the queries "must" be true.
+
+### esor(queries.. ESQuery) ESQuery
+esor takes one or more ESQueries and combines them into an [elastic bool query](https://www.elastic.co/guide/en/elasticsearch/reference/2.x/query-dsl-bool-query.html) so that at least one must be true.
+
+###esgt(field string, value Scalar) ESQuery
+esgt takes a field (expected to be numeric field in elastic) and returns results where the value of that field is greater than the specified value. It creates an [elastic range query](https://www.elastic.co/guide/en/elasticsearch/reference/2.x/query-dsl-range-query.html).
+
+###esgte(field string, value Scalar) ESQuery
+esgt takes a field (expected to be numeric field in elastic) and returns results where the value of that field is greater than or equal to the specified value. It creates an [elastic range query](https://www.elastic.co/guide/en/elasticsearch/reference/2.x/query-dsl-range-query.html).
+
+###eslt(field string, value Scalar) ESQuery
+esgt takes a field (expected to be numeric field in elastic) and returns results where the value of that field is less than the specified value. It creates an [elastic range query](https://www.elastic.co/guide/en/elasticsearch/reference/2.x/query-dsl-range-query.html).
+
+###eslte(field string, value Scalar) ESQuery
+esgt takes a field (expected to be numeric field in elastic) and returns results where the value of that field is less than or equal to the specified value. It creates an [elastic range query](https://www.elastic.co/guide/en/elasticsearch/reference/2.x/query-dsl-range-query.html).
+
+
 ## OpenTSDB Query Functions
 
 Query functions take a query string (like `sum:os.cpu{host=*}`) and return a seriesSet.
@@ -185,6 +255,9 @@ Generic query from endDuration to startDuration ago. If endDuration is the empty
 ### band(query string, duration string, period string, num scalar) seriesSet
 
 Band performs `num` queries of `duration` each, `period` apart and concatenates them together, starting `period` ago. So `band("avg:os.cpu", "1h", "1d", 7)` will return a series comprising of the given metric from 1d to 1d-1h-ago, 2d to 2d-1h-ago, etc, until 8d. This is a good way to get a time block from a certain hour of a day or certain day of a week over a long time period.
+
+### over(query string, duration string, period string, num scalar) seriesSet
+Over's arguments behave the same way as band. However over shifts the time of previous periods to be now, tags them with duration that each period was shifted, and merges those shifted periods into a single seriesSet. This is useful for displaying time over time graphs. For example, the same day week over week would be `over("avg:1h-avg:rate:os.cpu{host=ny-bosun01}", "1d", "1w", 4)`.
 
 ### change(query string, startDuration string, endDuration string) numberSet
 
@@ -241,6 +314,18 @@ Returns the first (least recent) data point in each series.
 ## forecastlr(seriesSet, y_val numberSet|scalar) numberSet
 
 Returns the number of seconds until a linear regression of each series will reach y_val.
+
+## linelr(seriesSet, d Duration) seriesSet
+
+Linelr return the linear regression line from the end of each series to end+duration (an [OpenTSDB duration string](http://opentsdb.net/docs/build/html/user_guide/query/dates.html)). It adds `regression=line` to the group / tagset. It is meant for graphing with expressions, for example:
+
+```
+$d = "1w"
+$q = q("avg:1h-avg:os.disk.fs.percent_free{}{host=ny-tsdb*,disk=/mnt*}", "2w", "")
+$line = linelr($q, "3n")
+$m = merge($q, $line)
+$m
+```
 
 ## last(seriesSet) numberSet
 
@@ -371,6 +456,10 @@ Returns the absolute value of each element in the numberSet.
 
 Returns the number of seconds of the [OpenTSDB duration string](http://opentsdb.net/docs/build/html/user_guide/query/dates.html).
 
+## tod(scalar) string
+
+Returns an [OpenTSDB duration string](http://opentsdb.net/docs/build/html/user_guide/query/dates.html) that represents the given number of seconds. This lets you do math on durations and then pass it to the duration arguments in functions like `q()`
+
 ## des(series, alpha scalar, beta scalar) series
 
 Returns series smoothed using Holt-Winters double exponential smoothing. Alpha
@@ -397,6 +486,18 @@ Remove any values lower than or equal to number from a series. Will error if thi
 
 Remove any NaN or Inf values from a series. Will error if this operation results in an empty series.
 
+## dropbool(seriesSet, seriesSet) seriesSet
+Drop datapoints where the corresponding value in the second series set is non-zero. (See Series Operations for what corresponding means). The following example drops tr_avg (avg response time per bucket) datapoints if the count in that bucket was + or - 100 from the average count over the time period. 
+
+Example:
+
+```
+$count = q("sum:traffic.haproxy.route_tr_count{host=literal_or(ny-logsql01),route=Questions/Show}", "30m", "")
+$avg = q("sum:traffic.haproxy.route_tr_avg{host=literal_or(ny-logsql01),route=Questions/Show}", "30m", "")
+$avgCount = avg($count)
+dropbool($avg, !($count < $avgCount-100 || $count > $avgCount+100))
+```
+
 ## epoch() scalar
 
 Returns the Unix epoch in seconds of the expression start time (scalar).
@@ -412,6 +513,24 @@ Returns the first count (scalar) results of number.
 ## lookup(table string, key string) numberSet
 
 Returns the first key from the given lookup table with matching tags.
+
+## series(tagset string, epoch, value, ...) seriesSet
+
+Returns a seriesSet with one series. The series will have a group (a.k.a tagset). You can then optionally pass epoch value pairs (if non are provided, the series will be empty). This is can be used for testing or drawing arbitary lines. For example:
+
+```
+$now = epoch()
+$hourAgo =  $now-d("1h")
+merge(series("foo=bar", $hourAgo, 5, $now, 10), series("foo=bar2", $hourAgo, 6, $now, 11))
+```
+
+## shift(seriesSet, dur string) seriesSet
+
+Shift takes a seriesSet and shifts the time forward by the value of dur ([OpenTSDB duration string](http://opentsdb.net/docs/build/html/user_guide/query/dates.html)) and adds a tag for representing the shift duration. This is meant so you can overlay times visually in a graph.
+
+## merge(SeriesSet...) seriesSet
+
+Merge takes multiple seriesSets and merges them into a single seriesSet. The function will error if any of the tag sets (groups) are identical. This is meant so you can display multiple seriesSets in a single expression graph.
 
 ## nv(numberSet, scalar) numberSet
 

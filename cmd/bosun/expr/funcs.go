@@ -10,31 +10,25 @@ import (
 	"strings"
 	"time"
 
-	"bosun.org/_third_party/github.com/GaryBoone/GoStats/stats"
-	"bosun.org/_third_party/github.com/MiniProfiler/go/miniprofiler"
 	"bosun.org/cmd/bosun/expr/parse"
 	"bosun.org/graphite"
+	"bosun.org/models"
 	"bosun.org/opentsdb"
 	"bosun.org/slog"
+	"github.com/GaryBoone/GoStats/stats"
+	"github.com/MiniProfiler/go/miniprofiler"
 )
-
-func logstashTagQuery(args []parse.Node) (parse.Tags, error) {
-	n := args[1].(*parse.StringNode)
-	t := make(parse.Tags)
-	for _, s := range strings.Split(n.Text, ",") {
-		t[strings.Split(s, ":")[0]] = struct{}{}
-	}
-	return t, nil
-}
 
 func tagQuery(args []parse.Node) (parse.Tags, error) {
 	n := args[0].(*parse.StringNode)
-	q, err := opentsdb.ParseQuery(n.Text)
+	// Since all 2.1 queries are valid 2.2 queries, at this time
+	// we can just use 2.2 to parse to identify group by tags
+	q, err := opentsdb.ParseQuery(n.Text, opentsdb.Version2_2)
 	if q == nil && err != nil {
 		return nil, err
 	}
 	t := make(parse.Tags)
-	for k := range q.Tags {
+	for k := range q.GroupByTags {
 		t[k] = struct{}{}
 	}
 	return t, nil
@@ -86,14 +80,14 @@ func tagRename(args []parse.Node) (parse.Tags, error) {
 // Graphite defines functions for use with a Graphite backend.
 var Graphite = map[string]parse.Func{
 	"graphiteBand": {
-		Args:   []parse.FuncType{parse.TypeString, parse.TypeString, parse.TypeString, parse.TypeString, parse.TypeScalar},
-		Return: parse.TypeSeriesSet,
+		Args:   []models.FuncType{models.TypeString, models.TypeString, models.TypeString, models.TypeString, models.TypeScalar},
+		Return: models.TypeSeriesSet,
 		Tags:   graphiteTagQuery,
 		F:      GraphiteBand,
 	},
 	"graphite": {
-		Args:   []parse.FuncType{parse.TypeString, parse.TypeString, parse.TypeString, parse.TypeString},
-		Return: parse.TypeSeriesSet,
+		Args:   []models.FuncType{models.TypeString, models.TypeString, models.TypeString, models.TypeString},
+		Return: models.TypeSeriesSet,
 		Tags:   graphiteTagQuery,
 		F:      GraphiteQuery,
 	},
@@ -102,31 +96,43 @@ var Graphite = map[string]parse.Func{
 // TSDB defines functions for use with an OpenTSDB backend.
 var TSDB = map[string]parse.Func{
 	"band": {
-		Args:   []parse.FuncType{parse.TypeString, parse.TypeString, parse.TypeString, parse.TypeScalar},
-		Return: parse.TypeSeriesSet,
+		Args:   []models.FuncType{models.TypeString, models.TypeString, models.TypeString, models.TypeScalar},
+		Return: models.TypeSeriesSet,
 		Tags:   tagQuery,
 		F:      Band,
 	},
+	"shiftBand": {
+		Args:   []models.FuncType{models.TypeString, models.TypeString, models.TypeString, models.TypeScalar},
+		Return: models.TypeSeriesSet,
+		Tags:   tagQuery,
+		F:      ShiftBand,
+	},
+	"over": {
+		Args:   []models.FuncType{models.TypeString, models.TypeString, models.TypeString, models.TypeScalar},
+		Return: models.TypeSeriesSet,
+		Tags:   tagQuery,
+		F:      Over,
+	},
 	"change": {
-		Args:   []parse.FuncType{parse.TypeString, parse.TypeString, parse.TypeString},
-		Return: parse.TypeNumberSet,
+		Args:   []models.FuncType{models.TypeString, models.TypeString, models.TypeString},
+		Return: models.TypeNumberSet,
 		Tags:   tagQuery,
 		F:      Change,
 	},
 	"count": {
-		Args:   []parse.FuncType{parse.TypeString, parse.TypeString, parse.TypeString},
-		Return: parse.TypeScalar,
+		Args:   []models.FuncType{models.TypeString, models.TypeString, models.TypeString},
+		Return: models.TypeScalar,
 		F:      Count,
 	},
 	"q": {
-		Args:   []parse.FuncType{parse.TypeString, parse.TypeString, parse.TypeString},
-		Return: parse.TypeSeriesSet,
+		Args:   []models.FuncType{models.TypeString, models.TypeString, models.TypeString},
+		Return: models.TypeSeriesSet,
 		Tags:   tagQuery,
 		F:      Query,
 	},
 	"window": {
-		Args:   []parse.FuncType{parse.TypeString, parse.TypeString, parse.TypeString, parse.TypeScalar, parse.TypeString},
-		Return: parse.TypeSeriesSet,
+		Args:   []models.FuncType{models.TypeString, models.TypeString, models.TypeString, models.TypeScalar, models.TypeString},
+		Return: models.TypeSeriesSet,
 		Tags:   tagQuery,
 		F:      Window,
 		Check:  windowCheck,
@@ -137,194 +143,276 @@ var builtins = map[string]parse.Func{
 	// Reduction functions
 
 	"avg": {
-		Args:   []parse.FuncType{parse.TypeSeriesSet},
-		Return: parse.TypeNumberSet,
+		Args:   []models.FuncType{models.TypeSeriesSet},
+		Return: models.TypeNumberSet,
 		Tags:   tagFirst,
 		F:      Avg,
 	},
 	"cCount": {
-		Args:   []parse.FuncType{parse.TypeSeriesSet},
-		Return: parse.TypeNumberSet,
+		Args:   []models.FuncType{models.TypeSeriesSet},
+		Return: models.TypeNumberSet,
 		Tags:   tagFirst,
 		F:      CCount,
 	},
 	"dev": {
-		Args:   []parse.FuncType{parse.TypeSeriesSet},
-		Return: parse.TypeNumberSet,
+		Args:   []models.FuncType{models.TypeSeriesSet},
+		Return: models.TypeNumberSet,
 		Tags:   tagFirst,
 		F:      Dev,
 	},
 	"diff": {
-		Args:   []parse.FuncType{parse.TypeSeriesSet},
-		Return: parse.TypeNumberSet,
+		Args:   []models.FuncType{models.TypeSeriesSet},
+		Return: models.TypeNumberSet,
 		Tags:   tagFirst,
 		F:      Diff,
 	},
 	"first": {
-		Args:   []parse.FuncType{parse.TypeSeriesSet},
-		Return: parse.TypeNumberSet,
+		Args:   []models.FuncType{models.TypeSeriesSet},
+		Return: models.TypeNumberSet,
 		Tags:   tagFirst,
 		F:      First,
 	},
 	"forecastlr": {
-		Args:   []parse.FuncType{parse.TypeSeriesSet, parse.TypeNumberSet},
-		Return: parse.TypeNumberSet,
+		Args:   []models.FuncType{models.TypeSeriesSet, models.TypeNumberSet},
+		Return: models.TypeNumberSet,
 		Tags:   tagFirst,
 		F:      Forecast_lr,
 	},
+	"linelr": {
+		Args:   []models.FuncType{models.TypeSeriesSet, models.TypeString},
+		Return: models.TypeSeriesSet,
+		Tags:   tagFirst,
+		F:      Line_lr,
+	},
 	"last": {
-		Args:   []parse.FuncType{parse.TypeSeriesSet},
-		Return: parse.TypeNumberSet,
+		Args:   []models.FuncType{models.TypeSeriesSet},
+		Return: models.TypeNumberSet,
 		Tags:   tagFirst,
 		F:      Last,
 	},
 	"len": {
-		Args:   []parse.FuncType{parse.TypeSeriesSet},
-		Return: parse.TypeNumberSet,
+		Args:   []models.FuncType{models.TypeSeriesSet},
+		Return: models.TypeNumberSet,
 		Tags:   tagFirst,
 		F:      Length,
 	},
 	"max": {
-		Args:   []parse.FuncType{parse.TypeSeriesSet},
-		Return: parse.TypeNumberSet,
+		Args:   []models.FuncType{models.TypeSeriesSet},
+		Return: models.TypeNumberSet,
 		Tags:   tagFirst,
 		F:      Max,
 	},
 	"median": {
-		Args:   []parse.FuncType{parse.TypeSeriesSet},
-		Return: parse.TypeNumberSet,
+		Args:   []models.FuncType{models.TypeSeriesSet},
+		Return: models.TypeNumberSet,
 		Tags:   tagFirst,
 		F:      Median,
 	},
 	"min": {
-		Args:   []parse.FuncType{parse.TypeSeriesSet},
-		Return: parse.TypeNumberSet,
+		Args:   []models.FuncType{models.TypeSeriesSet},
+		Return: models.TypeNumberSet,
 		Tags:   tagFirst,
 		F:      Min,
 	},
 	"percentile": {
-		Args:   []parse.FuncType{parse.TypeSeriesSet, parse.TypeNumberSet},
-		Return: parse.TypeNumberSet,
+		Args:   []models.FuncType{models.TypeSeriesSet, models.TypeNumberSet},
+		Return: models.TypeNumberSet,
 		Tags:   tagFirst,
 		F:      Percentile,
 	},
 	"since": {
-		Args:   []parse.FuncType{parse.TypeSeriesSet},
-		Return: parse.TypeNumberSet,
+		Args:   []models.FuncType{models.TypeSeriesSet},
+		Return: models.TypeNumberSet,
 		Tags:   tagFirst,
 		F:      Since,
 	},
 	"sum": {
-		Args:   []parse.FuncType{parse.TypeSeriesSet},
-		Return: parse.TypeNumberSet,
+		Args:   []models.FuncType{models.TypeSeriesSet},
+		Return: models.TypeNumberSet,
 		Tags:   tagFirst,
 		F:      Sum,
 	},
 	"streak": {
-		Args:   []parse.FuncType{parse.TypeSeriesSet},
-		Return: parse.TypeNumberSet,
+		Args:   []models.FuncType{models.TypeSeriesSet},
+		Return: models.TypeNumberSet,
 		Tags:   tagFirst,
 		F:      Streak,
 	},
 
 	// Group functions
 	"rename": {
-		Args:   []parse.FuncType{parse.TypeSeriesSet, parse.TypeString},
-		Return: parse.TypeSeriesSet,
+		Args:   []models.FuncType{models.TypeSeriesSet, models.TypeString},
+		Return: models.TypeSeriesSet,
 		Tags:   tagRename,
 		F:      Rename,
 	},
 
 	"t": {
-		Args:   []parse.FuncType{parse.TypeNumberSet, parse.TypeString},
-		Return: parse.TypeSeriesSet,
+		Args:   []models.FuncType{models.TypeNumberSet, models.TypeString},
+		Return: models.TypeSeriesSet,
 		Tags:   tagTranspose,
 		F:      Transpose,
 	},
 	"ungroup": {
-		Args:   []parse.FuncType{parse.TypeNumberSet},
-		Return: parse.TypeScalar,
+		Args:   []models.FuncType{models.TypeNumberSet},
+		Return: models.TypeScalar,
 		F:      Ungroup,
 	},
 
 	// Other functions
 
 	"abs": {
-		Args:   []parse.FuncType{parse.TypeNumberSet},
-		Return: parse.TypeNumberSet,
+		Args:   []models.FuncType{models.TypeNumberSet},
+		Return: models.TypeNumberSet,
 		Tags:   tagFirst,
 		F:      Abs,
 	},
 	"d": {
-		Args:   []parse.FuncType{parse.TypeString},
-		Return: parse.TypeScalar,
+		Args:   []models.FuncType{models.TypeString},
+		Return: models.TypeScalar,
 		F:      Duration,
 	},
+	"tod": {
+		Args:   []models.FuncType{models.TypeScalar},
+		Return: models.TypeString,
+		F:      ToDuration,
+	},
 	"des": {
-		Args:   []parse.FuncType{parse.TypeSeriesSet, parse.TypeScalar, parse.TypeScalar},
-		Return: parse.TypeSeriesSet,
+		Args:   []models.FuncType{models.TypeSeriesSet, models.TypeScalar, models.TypeScalar},
+		Return: models.TypeSeriesSet,
 		Tags:   tagFirst,
 		F:      Des,
 	},
 	"dropge": {
-		Args:   []parse.FuncType{parse.TypeSeriesSet, parse.TypeNumberSet},
-		Return: parse.TypeSeriesSet,
+		Args:   []models.FuncType{models.TypeSeriesSet, models.TypeNumberSet},
+		Return: models.TypeSeriesSet,
 		Tags:   tagFirst,
 		F:      DropGe,
 	},
 	"dropg": {
-		Args:   []parse.FuncType{parse.TypeSeriesSet, parse.TypeNumberSet},
-		Return: parse.TypeSeriesSet,
+		Args:   []models.FuncType{models.TypeSeriesSet, models.TypeNumberSet},
+		Return: models.TypeSeriesSet,
 		Tags:   tagFirst,
 		F:      DropG,
 	},
 	"drople": {
-		Args:   []parse.FuncType{parse.TypeSeriesSet, parse.TypeNumberSet},
-		Return: parse.TypeSeriesSet,
+		Args:   []models.FuncType{models.TypeSeriesSet, models.TypeNumberSet},
+		Return: models.TypeSeriesSet,
 		Tags:   tagFirst,
 		F:      DropLe,
 	},
 	"dropl": {
-		Args:   []parse.FuncType{parse.TypeSeriesSet, parse.TypeNumberSet},
-		Return: parse.TypeSeriesSet,
+		Args:   []models.FuncType{models.TypeSeriesSet, models.TypeNumberSet},
+		Return: models.TypeSeriesSet,
 		Tags:   tagFirst,
 		F:      DropL,
 	},
 	"dropna": {
-		Args:   []parse.FuncType{parse.TypeSeriesSet},
-		Return: parse.TypeSeriesSet,
+		Args:   []models.FuncType{models.TypeSeriesSet},
+		Return: models.TypeSeriesSet,
 		Tags:   tagFirst,
 		F:      DropNA,
 	},
+	"dropbool": {
+		Args:   []models.FuncType{models.TypeSeriesSet, models.TypeSeriesSet},
+		Return: models.TypeSeriesSet,
+		Tags:   tagFirst,
+		F:      DropBool,
+	},
 	"epoch": {
-		Args:   []parse.FuncType{},
-		Return: parse.TypeScalar,
+		Args:   []models.FuncType{},
+		Return: models.TypeScalar,
 		F:      Epoch,
 	},
 	"filter": {
-		Args:   []parse.FuncType{parse.TypeSeriesSet, parse.TypeNumberSet},
-		Return: parse.TypeSeriesSet,
+		Args:   []models.FuncType{models.TypeSeriesSet, models.TypeNumberSet},
+		Return: models.TypeSeriesSet,
 		Tags:   tagFirst,
 		F:      Filter,
 	},
 	"limit": {
-		Args:   []parse.FuncType{parse.TypeNumberSet, parse.TypeScalar},
-		Return: parse.TypeNumberSet,
+		Args:   []models.FuncType{models.TypeNumberSet, models.TypeScalar},
+		Return: models.TypeNumberSet,
 		Tags:   tagFirst,
 		F:      Limit,
 	},
 	"nv": {
-		Args:   []parse.FuncType{parse.TypeNumberSet, parse.TypeScalar},
-		Return: parse.TypeNumberSet,
+		Args:   []models.FuncType{models.TypeNumberSet, models.TypeScalar},
+		Return: models.TypeNumberSet,
 		Tags:   tagFirst,
 		F:      NV,
 	},
+	"series": {
+		Args:      []models.FuncType{models.TypeString, models.TypeScalar},
+		VArgs:     true,
+		VArgsPos:  1,
+		VArgsOmit: true,
+		Return:    models.TypeSeriesSet,
+		Tags:      tagFirst,
+		F:         SeriesFunc,
+	},
 	"sort": {
-		Args:   []parse.FuncType{parse.TypeNumberSet, parse.TypeString},
-		Return: parse.TypeNumberSet,
+		Args:   []models.FuncType{models.TypeNumberSet, models.TypeString},
+		Return: models.TypeNumberSet,
 		Tags:   tagFirst,
 		F:      Sort,
 	},
+	"shift": {
+		Args:   []models.FuncType{models.TypeSeriesSet, models.TypeString},
+		Return: models.TypeSeriesSet,
+		Tags:   tagFirst,
+		F:      Shift,
+	},
+	"merge": {
+		Args:   []models.FuncType{models.TypeSeriesSet},
+		VArgs:  true,
+		Return: models.TypeSeriesSet,
+		Tags:   tagFirst,
+		F:      Merge,
+	},
+}
+
+func SeriesFunc(e *State, T miniprofiler.Timer, tags string, pairs ...float64) (*Results, error) {
+	if len(pairs)%2 != 0 {
+		return nil, fmt.Errorf("uneven number of time stamps and values")
+	}
+	group, err := opentsdb.ParseTags(tags)
+	if err != nil {
+		return nil, fmt.Errorf("unable to parse tags: %v", err)
+	}
+	series := make(Series)
+	for i := 0; i < len(pairs); i += 2 {
+		series[time.Unix(int64(pairs[i]), 0)] = pairs[i+1]
+	}
+	return &Results{
+		Results: []*Result{
+			{
+				Value: series,
+				Group: group,
+			},
+		},
+	}, nil
+}
+
+func DropBool(e *State, T miniprofiler.Timer, target *Results, filter *Results) (*Results, error) {
+	res := Results{}
+	unions := e.union(target, filter, "dropbool union")
+	for _, union := range unions {
+		aSeries := union.A.Value().(Series)
+		bSeries := union.B.Value().(Series)
+		newSeries := make(Series)
+		for k, v := range aSeries {
+			if bv, ok := bSeries[k]; ok {
+				if bv != float64(0) {
+					newSeries[k] = v
+				}
+			}
+		}
+		if len(newSeries) > 0 {
+			res.Results = append(res.Results, &Result{Group: union.Group, Value: newSeries})
+		}
+	}
+	return &res, nil
 }
 
 func Epoch(e *State, T miniprofiler.Timer) (*Results, error) {
@@ -336,6 +424,11 @@ func Epoch(e *State, T miniprofiler.Timer) (*Results, error) {
 }
 
 func NV(e *State, T miniprofiler.Timer, series *Results, v float64) (results *Results, err error) {
+	// If there are no results in the set, promote it to a number with the empty group ({})
+	if len(series.Results) == 0 {
+		series.Results = append(series.Results, &Result{Value: Number(v), Group: make(opentsdb.TagSet)})
+		return series, nil
+	}
 	series.NaNValue = &v
 	return series, nil
 }
@@ -377,6 +470,43 @@ func Filter(e *State, T miniprofiler.Timer, series *Results, number *Results) (*
 	return series, nil
 }
 
+func Merge(e *State, T miniprofiler.Timer, series ...*Results) (*Results, error) {
+	res := &Results{}
+	if len(series) == 0 {
+		return res, fmt.Errorf("merge requires at least one result")
+	}
+	if len(series) == 1 {
+		return series[0], nil
+	}
+	seen := make(map[string]bool)
+	for _, r := range series {
+		for _, entry := range r.Results {
+			if _, ok := seen[entry.Group.String()]; ok {
+				return res, fmt.Errorf("duplicate group in merge: %s", entry.Group.String())
+			}
+			seen[entry.Group.String()] = true
+		}
+		res.Results = append(res.Results, r.Results...)
+	}
+	return res, nil
+}
+
+func Shift(e *State, T miniprofiler.Timer, series *Results, d string) (*Results, error) {
+	dur, err := opentsdb.ParseDuration(d)
+	if err != nil {
+		return series, err
+	}
+	for _, result := range series.Results {
+		newSeries := make(Series)
+		for t, v := range result.Value.Value().(Series) {
+			newSeries[t.Add(time.Duration(dur))] = v
+		}
+		result.Group["shift"] = d
+		result.Value = newSeries
+	}
+	return series, nil
+}
+
 func Duration(e *State, T miniprofiler.Timer, d string) (*Results, error) {
 	duration, err := opentsdb.ParseDuration(d)
 	if err != nil {
@@ -385,6 +515,15 @@ func Duration(e *State, T miniprofiler.Timer, d string) (*Results, error) {
 	return &Results{
 		Results: []*Result{
 			{Value: Scalar(duration.Seconds())},
+		},
+	}, nil
+}
+
+func ToDuration(e *State, T miniprofiler.Timer, sec float64) (*Results, error) {
+	d := opentsdb.Duration(time.Duration(int64(sec)) * time.Second)
+	return &Results{
+		Results: []*Result{
+			{Value: String(d.HumanString())},
 		},
 	}, nil
 }
@@ -458,6 +597,10 @@ func parseGraphiteResponse(req *graphite.Request, s *graphite.Response, formatTa
 					tags[key] = nodes[i]
 				}
 			}
+		}
+		if !tags.Valid() {
+			msg := fmt.Sprintf("returned target '%s' would make an invalid tag '%s'", res.Target, tags.String())
+			return nil, fmt.Errorf(parseErrFmt, req.URL, msg)
 		}
 		if ts := tags.String(); !seen[ts] {
 			seen[ts] = true
@@ -566,7 +709,7 @@ func GraphiteBand(e *State, T miniprofiler.Timer, query, duration, period, forma
 	return
 }
 
-func bandTSDB(e *State, T miniprofiler.Timer, query, duration, period string, num float64, rfunc func(*Results, *opentsdb.Response) error) (r *Results, err error) {
+func bandTSDB(e *State, T miniprofiler.Timer, query, duration, period string, num float64, rfunc func(*Results, *opentsdb.Response, time.Duration) error) (r *Results, err error) {
 	r = new(Results)
 	r.IgnoreOtherUnjoined = true
 	r.IgnoreUnjoined = true
@@ -584,12 +727,14 @@ func bandTSDB(e *State, T miniprofiler.Timer, query, duration, period string, nu
 			err = fmt.Errorf("num out of bounds")
 		}
 		var q *opentsdb.Query
-		q, err = opentsdb.ParseQuery(query)
+		q, err = opentsdb.ParseQuery(query, e.tsdbContext.Version())
 		if err != nil {
 			return
 		}
-		if err = e.Search.Expand(q); err != nil {
-			return
+		if !e.tsdbContext.Version().FilterSupport() {
+			if err = e.Search.Expand(q); err != nil {
+				return
+			}
 		}
 		req := opentsdb.Request{
 			Queries: []*opentsdb.Query{q},
@@ -613,7 +758,9 @@ func bandTSDB(e *State, T miniprofiler.Timer, query, duration, period string, nu
 				if e.squelched(res.Tags) {
 					continue
 				}
-				if err = rfunc(r, res); err != nil {
+				//offset := e.now.Sub(now.Add(time.Duration(p-d)))
+				offset := e.now.Sub(now)
+				if err = rfunc(r, res, offset); err != nil {
 					return
 				}
 			}
@@ -628,7 +775,7 @@ func Window(e *State, T miniprofiler.Timer, query, duration, period string, num 
 		return nil, fmt.Errorf("expr: Window: no %v function", rfunc)
 	}
 	windowFn := reflect.ValueOf(fn.F)
-	bandFn := func(results *Results, resp *opentsdb.Response) error {
+	bandFn := func(results *Results, resp *opentsdb.Response, offset time.Duration) error {
 		values := make(Series)
 		min := int64(math.MaxInt64)
 		for k, v := range resp.DPS {
@@ -692,14 +839,14 @@ func windowCheck(t *parse.Tree, f *parse.FuncNode) error {
 	if !ok {
 		return fmt.Errorf("expr: Window: unknown function %v", name)
 	}
-	if len(v.Args) != 1 || v.Args[0] != parse.TypeSeriesSet || v.Return != parse.TypeNumberSet {
+	if len(v.Args) != 1 || v.Args[0] != models.TypeSeriesSet || v.Return != models.TypeNumberSet {
 		return fmt.Errorf("expr: Window: %v is not a reduction function", name)
 	}
 	return nil
 }
 
 func Band(e *State, T miniprofiler.Timer, query, duration, period string, num float64) (r *Results, err error) {
-	r, err = bandTSDB(e, T, query, duration, period, num, func(r *Results, res *opentsdb.Response) error {
+	r, err = bandTSDB(e, T, query, duration, period, num, func(r *Results, res *opentsdb.Response, offset time.Duration) error {
 		newarr := true
 		for _, a := range r.Results {
 			if !a.Group.Equal(res.Tags) {
@@ -733,6 +880,91 @@ func Band(e *State, T miniprofiler.Timer, query, duration, period string, num fl
 	if err != nil {
 		err = fmt.Errorf("expr: Band: %v", err)
 	}
+	return
+}
+
+func ShiftBand(e *State, T miniprofiler.Timer, query, duration, period string, num float64) (r *Results, err error) {
+	r, err = bandTSDB(e, T, query, duration, period, num, func(r *Results, res *opentsdb.Response, offset time.Duration) error {
+		values := make(Series)
+		a := &Result{Group: res.Tags.Merge(opentsdb.TagSet{"shift": offset.String()})}
+		for k, v := range res.DPS {
+			i, e := strconv.ParseInt(k, 10, 64)
+			if e != nil {
+				return e
+			}
+			values[time.Unix(i, 0).Add(offset).UTC()] = float64(v)
+		}
+		a.Value = values
+		r.Results = append(r.Results, a)
+		return nil
+	})
+	if err != nil {
+		err = fmt.Errorf("expr: Band: %v", err)
+	}
+	return
+}
+
+func Over(e *State, T miniprofiler.Timer, query, duration, period string, num float64) (r *Results, err error) {
+	r = new(Results)
+	r.IgnoreOtherUnjoined = true
+	r.IgnoreUnjoined = true
+	T.Step("band", func(T miniprofiler.Timer) {
+		var d, p opentsdb.Duration
+		d, err = opentsdb.ParseDuration(duration)
+		if err != nil {
+			return
+		}
+		p, err = opentsdb.ParseDuration(period)
+		if err != nil {
+			return
+		}
+		if num < 1 || num > 100 {
+			err = fmt.Errorf("num out of bounds")
+		}
+		var q *opentsdb.Query
+		q, err = opentsdb.ParseQuery(query, e.tsdbContext.Version())
+		if err != nil {
+			return
+		}
+		if !e.tsdbContext.Version().FilterSupport() {
+			if err = e.Search.Expand(q); err != nil {
+				return
+			}
+		}
+		req := opentsdb.Request{
+			Queries: []*opentsdb.Query{q},
+		}
+		now := e.now
+		req.End = now.Unix()
+		req.Start = now.Add(time.Duration(-d)).Unix()
+		for i := 0; i < int(num); i++ {
+			var s opentsdb.ResponseSet
+			s, err = timeTSDBRequest(e, T, &req)
+			if err != nil {
+				return
+			}
+			offset := e.now.Sub(now)
+			for _, res := range s {
+				if e.squelched(res.Tags) {
+					continue
+				}
+				values := make(Series)
+				a := &Result{Group: res.Tags.Merge(opentsdb.TagSet{"shift": offset.String()})}
+				for k, v := range res.DPS {
+					i, err := strconv.ParseInt(k, 10, 64)
+					if err != nil {
+						return
+					}
+					values[time.Unix(i, 0).Add(offset).UTC()] = float64(v)
+				}
+				a.Value = values
+				r.Results = append(r.Results, a)
+			}
+			now = now.Add(time.Duration(-p))
+			req.End = now.Unix()
+			req.Start = now.Add(time.Duration(-d)).Unix()
+		}
+	})
 	return
 }
 
@@ -783,12 +1015,14 @@ func graphiteTagQuery(args []parse.Node) (parse.Tags, error) {
 
 func Query(e *State, T miniprofiler.Timer, query, sduration, eduration string) (r *Results, err error) {
 	r = new(Results)
-	q, err := opentsdb.ParseQuery(query)
+	q, err := opentsdb.ParseQuery(query, e.tsdbContext.Version())
 	if q == nil && err != nil {
 		return
 	}
-	if err = e.Search.Expand(q); err != nil {
-		return
+	if !e.tsdbContext.Version().FilterSupport() {
+		if err = e.Search.Expand(q); err != nil {
+			return
+		}
 	}
 	sd, err := opentsdb.ParseDuration(sduration)
 	if err != nil {
@@ -1182,6 +1416,42 @@ func (e *State) forecast_lr(dps Series, args ...float64) float64 {
 		s = tenYears
 	}
 	return s.Seconds()
+}
+
+func Line_lr(e *State, T miniprofiler.Timer, series *Results, d string) (*Results, error) {
+	dur, err := opentsdb.ParseDuration(d)
+	if err != nil {
+		return series, err
+	}
+	for _, res := range series.Results {
+		res.Value = line_lr(res.Value.(Series), time.Duration(dur))
+		res.Group.Merge(opentsdb.TagSet{"regression": "line"})
+	}
+	return series, nil
+}
+
+// line_lr generates a series representing the line up to duration in the future.
+func line_lr(dps Series, d time.Duration) Series {
+	var x []float64
+	var y []float64
+	sortedDPS := NewSortedSeries(dps)
+	var maxT time.Time
+	if len(sortedDPS) > 1 {
+		maxT = sortedDPS[len(sortedDPS)-1].T
+	}
+	for _, v := range sortedDPS {
+		xv := float64(v.T.Unix())
+		x = append(x, xv)
+		y = append(y, v.V)
+	}
+	var slope, intercept, _, _, _, _ = stats.LinearRegression(x, y)
+	s := make(Series)
+	// First point in the regression line
+	s[maxT] = float64(maxT.Unix())*slope + intercept
+	// Last point
+	last := maxT.Add(d)
+	s[last] = float64(last.Unix())*slope + intercept
+	return s
 }
 
 func Percentile(e *State, T miniprofiler.Timer, series *Results, p *Results) (r *Results, err error) {

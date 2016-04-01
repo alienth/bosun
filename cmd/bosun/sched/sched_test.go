@@ -12,16 +12,17 @@ import (
 	"testing"
 	"time"
 
-	"bosun.org/_third_party/github.com/MiniProfiler/go/miniprofiler"
 	"bosun.org/cmd/bosun/conf"
 	"bosun.org/cmd/bosun/database"
-	"bosun.org/cmd/bosun/expr"
+	"bosun.org/cmd/bosun/database/test"
+	"bosun.org/models"
 	"bosun.org/opentsdb"
 	"bosun.org/slog"
+	"github.com/MiniProfiler/go/miniprofiler"
 )
 
 func init() {
-	slog.Set(&slog.StdLog{log.New(ioutil.Discard, "", log.LstdFlags)})
+	slog.Set(&slog.StdLog{Log: log.New(ioutil.Discard, "", log.LstdFlags)})
 	log.SetOutput(ioutil.Discard)
 }
 
@@ -33,8 +34,8 @@ type schedTest struct {
 	conf    string
 	queries map[string]opentsdb.ResponseSet
 	// state -> active
-	state    map[schedState]bool
-	previous map[expr.AlertKey]*State
+	state   map[schedState]bool
+	touched map[models.AlertKey]time.Time
 }
 
 // test-only function to check all alerts immediately.
@@ -51,60 +52,18 @@ func check(s *Schedule, t time.Time) {
 	}
 }
 
-//fake data access for tests. Perhaps a full mock would be more appropriate, once the interface contains more.
-// this implementation just panics
-type nopDataAccess struct{}
+var db database.DataAccess
 
-func (n *nopDataAccess) PutMetricMetadata(metric string, field string, value string) error {
-	panic("not implemented")
-}
-func (n *nopDataAccess) GetMetricMetadata(metric string) (*database.MetricMetadata, error) {
-	panic("not implemented")
-}
-func (n *nopDataAccess) PutTagMetadata(tags opentsdb.TagSet, name string, value string, updated time.Time) error {
-	panic("not implemented")
-}
-func (n *nopDataAccess) GetTagMetadata(tags opentsdb.TagSet, name string) ([]*database.TagMetadata, error) {
-	panic("not implemented")
-}
-func (n *nopDataAccess) DeleteTagMetadata(tags opentsdb.TagSet, name string) error {
-	panic("not implemented")
-}
-func (n *nopDataAccess) Search_AddMetricForTag(tagK, tagV, metric string, time int64) error {
-	panic("not implemented")
-}
-func (n *nopDataAccess) Search_GetMetricsForTag(tagK, tagV string) (map[string]int64, error) {
-	panic("not implemented")
-}
-func (n *nopDataAccess) Search_AddTagKeyForMetric(metric, tagK string, time int64) error {
-	panic("not implemented")
-}
-func (n *nopDataAccess) Search_GetTagKeysForMetric(metric string) (map[string]int64, error) {
-	panic("not implemented")
-}
-func (n *nopDataAccess) Search_AddMetric(metric string, time int64) error {
-	panic("not implemented")
-}
-func (n *nopDataAccess) Search_GetAllMetrics() (map[string]int64, error) {
-	panic("not implemented")
-}
-func (n *nopDataAccess) Search_AddTagValue(metric, tagK, tagV string, time int64) error {
-	panic("not implemented")
-}
-func (n *nopDataAccess) Search_GetTagValues(metric, tagK string) (map[string]int64, error) {
-	panic("not implemented")
-}
-func (n *nopDataAccess) Search_AddMetricTagSet(metric, tagSet string, time int64) error {
-	panic("not implemented")
-}
-func (n *nopDataAccess) Search_GetMetricTagSets(metric string, tags opentsdb.TagSet) (map[string]int64, error) {
-	panic("not implemented")
+func setup() func() {
+	testDb, closer := dbtest.StartTestRedis(9992)
+	db = testDb
+	return closer
 }
 
 func initSched(c *conf.Conf) (*Schedule, error) {
 	c.StateFile = ""
 	s := new(Schedule)
-	s.DataAccess = &nopDataAccess{}
+	s.DataAccess = db
 	err := s.Init(c)
 	return s, err
 }
@@ -148,8 +107,8 @@ func testSched(t *testing.T, st *schedTest) (s *Schedule) {
 
 	time.Sleep(time.Millisecond * 250)
 	s, _ = initSched(c)
-	if st.previous != nil {
-		s.status = st.previous
+	for ak, time := range st.touched {
+		s.DataAccess.State().TouchAlertKey(ak, time)
 	}
 	check(s, queryTime)
 	groups, err := s.MarshalGroups(new(miniprofiler.Profile), "")
@@ -193,6 +152,7 @@ var queryTime = time.Date(2000, 1, 1, 12, 0, 0, 0, time.UTC)
 var window5Min = `"9.467277e+08", "9.46728e+08"`
 
 func TestCrit(t *testing.T) {
+	defer setup()()
 	s := testSched(t, &schedTest{
 		conf: `alert a {
 			crit = avg(q("avg:m{a=b}", "5m", "")) > 0
@@ -216,6 +176,7 @@ func TestCrit(t *testing.T) {
 }
 
 func TestBandDisableUnjoined(t *testing.T) {
+	defer setup()()
 	testSched(t, &schedTest{
 		conf: `alert a {
 			$sum = "sum:m{a=*}"
@@ -242,6 +203,7 @@ func TestBandDisableUnjoined(t *testing.T) {
 }
 
 func TestCount(t *testing.T) {
+	defer setup()()
 	testSched(t, &schedTest{
 		conf: `alert a {
 			crit = count("sum:m{a=*}", "5m", "") != 2
@@ -264,13 +226,7 @@ func TestCount(t *testing.T) {
 }
 
 func TestUnknown(t *testing.T) {
-	state := NewStatus("a{a=b}")
-	state.Touched = queryTime.Add(-10 * time.Minute)
-	state.Append(&Event{Status: StNormal, Time: state.Touched})
-	stillValid := NewStatus("a{a=c}")
-	stillValid.Touched = queryTime.Add(-9 * time.Minute)
-	stillValid.Append(&Event{Status: StNormal, Time: stillValid.Touched})
-
+	defer setup()()
 	testSched(t, &schedTest{
 		conf: `alert a {
 			crit = avg(q("avg:m{a=*}", "5m", "")) > 0
@@ -281,21 +237,15 @@ func TestUnknown(t *testing.T) {
 		state: map[schedState]bool{
 			schedState{"a{a=b}", "unknown"}: true,
 		},
-		previous: map[expr.AlertKey]*State{
-			"a{a=b}": state,
-			"a{a=c}": stillValid,
+		touched: map[models.AlertKey]time.Time{
+			"a{a=b}": queryTime.Add(-10 * time.Minute),
+			"a{a=c}": queryTime.Add(-9 * time.Minute),
 		},
 	})
 }
 
 func TestUnknown_HalfFreq(t *testing.T) {
-	state := NewStatus("a{a=b}")
-	state.Touched = queryTime.Add(-20 * time.Minute)
-	state.Append(&Event{Status: StNormal, Time: state.Touched})
-	stillValid := NewStatus("a{a=c}")
-	stillValid.Touched = queryTime.Add(-19 * time.Minute)
-	stillValid.Append(&Event{Status: StNormal, Time: stillValid.Touched})
-
+	defer setup()()
 	testSched(t, &schedTest{
 		conf: `alert a {
 			crit = avg(q("avg:m{a=*}", "5m", "")) > 0
@@ -307,17 +257,15 @@ func TestUnknown_HalfFreq(t *testing.T) {
 		state: map[schedState]bool{
 			schedState{"a{a=b}", "unknown"}: true,
 		},
-		previous: map[expr.AlertKey]*State{
-			"a{a=b}": state,
-			"a{a=c}": stillValid,
+		touched: map[models.AlertKey]time.Time{
+			"a{a=b}": queryTime.Add(-20 * time.Minute),
+			"a{a=c}": queryTime.Add(-19 * time.Minute),
 		},
 	})
 }
 
 func TestUnknown_WithError(t *testing.T) {
-	state := NewStatus("a{a=b}")
-	state.Touched = queryTime.Add(-10 * time.Minute)
-	state.Append(&Event{Status: StNormal, Time: state.Touched})
+	defer setup()()
 
 	s := testSched(t, &schedTest{
 		conf: `alert a {
@@ -327,16 +275,18 @@ func TestUnknown_WithError(t *testing.T) {
 			`q("avg:m{a=*}", ` + window5Min + `)`: nil,
 		},
 		state: map[schedState]bool{},
-		previous: map[expr.AlertKey]*State{
-			"a{a=b}": state,
+		touched: map[models.AlertKey]time.Time{
+			"a{a=b}": queryTime.Add(-10 * time.Minute),
 		},
 	})
+
 	if s.AlertSuccessful("a") {
 		t.Fatal("Expected alert a to be in a failed state")
 	}
 }
 
 func TestRename(t *testing.T) {
+	defer setup()()
 	testSched(t, &schedTest{
 		conf: `
 		alert ping.host {
@@ -385,6 +335,24 @@ func TestRename(t *testing.T) {
 			schedState{"ping.host{host=ny-kbrandt02,source=ny-kbrandt02}", "warning"}: true,
 			schedState{"ping.host{host=ny-web01,source=ny-kbrandt02}", "warning"}:     true,
 			schedState{"os.cpu{host=ny-web02}", "warning"}:                            true,
+		},
+	})
+}
+
+func TestUnknownsAreNormal(t *testing.T) {
+	defer setup()()
+	testSched(t, &schedTest{
+		conf: `alert a {
+            unknownIsNormal = true
+            crit = avg(q("avg:m{a=*}", "5m", "")) > 0
+		}`,
+		queries: map[string]opentsdb.ResponseSet{
+			`q("avg:m{a=*}", ` + window5Min + `)`: {},
+		},
+		state: map[schedState]bool{},
+		touched: map[models.AlertKey]time.Time{
+			"a{a=b}": queryTime.Add(-10 * time.Minute),
+			"a{a=c}": queryTime.Add(-9 * time.Minute),
 		},
 	})
 }

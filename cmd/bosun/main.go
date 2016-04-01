@@ -14,10 +14,10 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"syscall"
 	"time"
 
-	"bosun.org/_third_party/github.com/facebookgo/httpcontrol"
-	"bosun.org/_third_party/gopkg.in/fsnotify.v1"
+	"bosun.org/_version"
 	"bosun.org/cmd/bosun/conf"
 	"bosun.org/cmd/bosun/sched"
 	"bosun.org/cmd/bosun/web"
@@ -27,7 +27,8 @@ import (
 	"bosun.org/opentsdb"
 	"bosun.org/slog"
 	"bosun.org/util"
-	"bosun.org/version"
+	"github.com/facebookgo/httpcontrol"
+	"gopkg.in/fsnotify.v1"
 )
 
 type bosunHttpTransport struct {
@@ -135,6 +136,12 @@ func main() {
 			c.TSDBHost = tsdbHost.Host
 		}
 	}
+	if c.InternetProxy != "" {
+		web.InternetProxy, err = url.Parse(c.InternetProxy)
+		if err != nil {
+			slog.Fatalf("InternetProxy error: %s", err)
+		}
+	}
 	if *flagQuiet {
 		c.Quiet = true
 	}
@@ -146,7 +153,7 @@ func main() {
 	}()
 	go func() {
 		sc := make(chan os.Signal, 1)
-		signal.Notify(sc, os.Interrupt)
+		signal.Notify(sc, os.Interrupt, syscall.SIGTERM)
 		killing := false
 		for range sc {
 			if killing {

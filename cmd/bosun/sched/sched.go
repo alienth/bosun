@@ -2,18 +2,13 @@ package sched // import "bosun.org/cmd/bosun/sched"
 
 import (
 	"encoding/gob"
-	"encoding/json"
 	"fmt"
 	"net"
 	"reflect"
-	"sort"
+	"strings"
 	"sync"
 	"time"
 
-	"bosun.org/_third_party/github.com/MiniProfiler/go/miniprofiler"
-	"bosun.org/_third_party/github.com/boltdb/bolt"
-	"bosun.org/_third_party/github.com/bradfitz/slice"
-	"bosun.org/_third_party/github.com/tatsushid/go-fastping"
 	"bosun.org/cmd/bosun/cache"
 	"bosun.org/cmd/bosun/conf"
 	"bosun.org/cmd/bosun/database"
@@ -21,9 +16,18 @@ import (
 	"bosun.org/cmd/bosun/search"
 	"bosun.org/collect"
 	"bosun.org/metadata"
+	"bosun.org/models"
 	"bosun.org/opentsdb"
 	"bosun.org/slog"
+	"github.com/MiniProfiler/go/miniprofiler"
+	"github.com/boltdb/bolt"
+	"github.com/bradfitz/slice"
+	"github.com/tatsushid/go-fastping"
 )
+
+func utcNow() time.Time {
+	return time.Now().UTC()
+}
 
 func init() {
 	gob.Register(expr.Number(0))
@@ -36,31 +40,23 @@ type Schedule struct {
 	mutexAquired  time.Time
 	mutexWaitTime int64
 
-	Conf    *conf.Conf
-	status  States
-	Silence map[string]*Silence
-	Group   map[time.Time]expr.AlertKeys
+	Conf  *conf.Conf
+	Group map[time.Time]models.AlertKeys
 
-	Incidents map[uint64]*Incident
-	Search    *search.Search
-
-	AlertStatuses map[string]*AlertStatus
+	Search *search.Search
 
 	//channel signals an alert has added notifications, and notifications should be processed.
 	nc chan interface{}
 	//notifications to be sent immediately
-	pendingNotifications map[*conf.Notification][]*State
-	//notifications we are currently tracking, potentially with future or repeated actions.
-	Notifications map[expr.AlertKey]map[string]time.Time
+	pendingNotifications map[*conf.Notification][]*models.IncidentState
+
 	//unknown states that need to be notified about. Collected and sent in batches.
-	pendingUnknowns map[*conf.Notification][]*State
+	pendingUnknowns map[*conf.Notification][]*models.IncidentState
 
-	alertStatusLock sync.Mutex
-	maxIncidentId   uint64
-	incidentLock    sync.Mutex
-	db              *bolt.DB
+	db *bolt.DB
 
-	LastCheck time.Time
+	lastLogTimes map[models.AlertKey]time.Time
+	LastCheck    time.Time
 
 	ctx *checkContext
 
@@ -68,29 +64,31 @@ type Schedule struct {
 }
 
 func (s *Schedule) Init(c *conf.Conf) error {
+	//initialize all variables and collections so they are ready to use.
+	//this will be called once at app start, and also every time the rule
+	//page runs, so be careful not to spawn long running processes that can't
+	//be avoided.
 	var err error
 	s.Conf = c
-	s.AlertStatuses = make(map[string]*AlertStatus)
-	s.Silence = make(map[string]*Silence)
-	s.Group = make(map[time.Time]expr.AlertKeys)
-	s.Incidents = make(map[uint64]*Incident)
-	s.pendingUnknowns = make(map[*conf.Notification][]*State)
-	s.status = make(States)
-	s.LastCheck = time.Now()
-	s.ctx = &checkContext{time.Now(), cache.New(0)}
+	s.Group = make(map[time.Time]models.AlertKeys)
+	s.pendingUnknowns = make(map[*conf.Notification][]*models.IncidentState)
+	s.lastLogTimes = make(map[models.AlertKey]time.Time)
+	s.LastCheck = utcNow()
+	s.ctx = &checkContext{utcNow(), cache.New(0)}
 	if s.DataAccess == nil {
 		if c.RedisHost != "" {
-			s.DataAccess = database.NewDataAccess(c.RedisHost, true)
+			s.DataAccess = database.NewDataAccess(c.RedisHost, true, c.RedisDb, c.RedisPassword)
 		} else {
-			bind := "127.0.0.1:9565"
-			_, err := database.StartLedis(c.LedisDir, bind)
+			_, err := database.StartLedis(c.LedisDir, c.LedisBindAddr)
 			if err != nil {
 				return err
 			}
-			s.DataAccess = database.NewDataAccess(bind, false)
+			s.DataAccess = database.NewDataAccess(c.LedisBindAddr, false, 0, "")
 		}
 	}
-	s.Search = search.NewSearch(s.DataAccess)
+	if s.Search == nil {
+		s.Search = search.NewSearch(s.DataAccess)
+	}
 	if c.StateFile != "" {
 		s.db, err = bolt.Open(c.StateFile, 0600, nil)
 		if err != nil {
@@ -115,9 +113,9 @@ func init() {
 }
 
 func (s *Schedule) Lock(method string) {
-	start := time.Now()
+	start := utcNow()
 	s.mutex.Lock()
-	s.mutexAquired = time.Now()
+	s.mutexAquired = utcNow()
 	s.mutexHolder = method
 	s.mutexWaitTime = int64(s.mutexAquired.Sub(start) / time.Millisecond) // remember this so we don't have to call put until we leave the critical section.
 }
@@ -141,7 +139,7 @@ func (s *Schedule) PutMetadata(k metadata.Metakey, v interface{}) error {
 
 	isCoreMeta := (k.Name == "desc" || k.Name == "unit" || k.Name == "rate")
 	if !isCoreMeta {
-		s.DataAccess.PutTagMetadata(k.TagSet(), k.Name, fmt.Sprint(v), time.Now().UTC())
+		s.DataAccess.Metadata().PutTagMetadata(k.TagSet(), k.Name, fmt.Sprint(v), utcNow())
 		return nil
 	}
 	if k.Metric == "" {
@@ -155,15 +153,21 @@ func (s *Schedule) PutMetadata(k metadata.Metakey, v interface{}) error {
 		slog.Error(err)
 		return err
 	}
-	return s.DataAccess.PutMetricMetadata(k.Metric, k.Name, strVal)
+	return s.DataAccess.Metadata().PutMetricMetadata(k.Metric, k.Name, strVal)
 }
 
 func (s *Schedule) DeleteMetadata(tags opentsdb.TagSet, name string) error {
-	return s.DataAccess.DeleteTagMetadata(tags, name)
+	return s.DataAccess.Metadata().DeleteTagMetadata(tags, name)
 }
 
 func (s *Schedule) MetadataMetrics(metric string) (*database.MetricMetadata, error) {
-	mm, err := s.DataAccess.GetMetricMetadata(metric)
+	//denormalized metrics should give metric metadata for their undenormalized counterparts
+	if strings.HasPrefix(metric, "__") {
+		if idx := strings.Index(metric, "."); idx != -1 {
+			metric = metric[idx+1:]
+		}
+	}
+	mm, err := s.DataAccess.Metadata().GetMetricMetadata(metric)
 	if err != nil {
 		return nil, err
 	}
@@ -199,7 +203,7 @@ func (s *Schedule) GetMetadata(metric string, subset opentsdb.TagSet) ([]metadat
 			})
 		}
 	} else {
-		meta, err := s.DataAccess.GetTagMetadata(subset, "")
+		meta, err := s.DataAccess.Metadata().GetTagMetadata(subset, "")
 		if err != nil {
 			return nil, err
 		}
@@ -216,25 +220,27 @@ func (s *Schedule) GetMetadata(metric string, subset opentsdb.TagSet) ([]metadat
 	return ms, nil
 }
 
-type States map[expr.AlertKey]*State
+type States map[models.AlertKey]*models.IncidentState
 
 type StateTuple struct {
-	NeedAck  bool
-	Active   bool
-	Status   Status
-	Silenced bool
+	NeedAck       bool
+	Active        bool
+	Status        models.Status
+	CurrentStatus models.Status
+	Silenced      bool
 }
 
 // GroupStates groups by NeedAck, Active, Status, and Silenced.
-func (states States) GroupStates(silenced map[expr.AlertKey]Silence) map[StateTuple]States {
+func (states States) GroupStates(silenced SilenceTester) map[StateTuple]States {
 	r := make(map[StateTuple]States)
 	for ak, st := range states {
-		_, sil := silenced[ak]
+		sil := silenced(ak) != nil
 		t := StateTuple{
-			st.NeedAck,
-			st.IsActive(),
-			st.AbnormalStatus(),
-			sil,
+			NeedAck:       st.NeedAck,
+			Active:        st.IsActive(),
+			Status:        st.LastAbnormalStatus,
+			CurrentStatus: st.CurrentStatus,
+			Silenced:      sil,
 		}
 		if _, present := r[t]; !present {
 			r[t] = make(States)
@@ -246,19 +252,19 @@ func (states States) GroupStates(silenced map[expr.AlertKey]Silence) map[StateTu
 
 // GroupSets returns slices of TagSets, grouped by most common ancestor. Those
 // with no shared ancestor are grouped by alert name.
-func (states States) GroupSets() map[string]expr.AlertKeys {
+func (states States) GroupSets(minGroup int) map[string]models.AlertKeys {
 	type Pair struct {
 		k, v string
 	}
-	groups := make(map[string]expr.AlertKeys)
-	seen := make(map[*State]bool)
+	groups := make(map[string]models.AlertKeys)
+	seen := make(map[*models.IncidentState]bool)
 	for {
 		counts := make(map[Pair]int)
 		for _, s := range states {
 			if seen[s] {
 				continue
 			}
-			for k, v := range s.Group {
+			for k, v := range s.AlertKey.Group() {
 				counts[Pair{k, v}]++
 			}
 		}
@@ -273,77 +279,75 @@ func (states States) GroupSets() map[string]expr.AlertKeys {
 				pair = p
 			}
 		}
-		if max == 1 {
+		if max < minGroup {
 			break
 		}
-		var group expr.AlertKeys
+		var group models.AlertKeys
 		for _, s := range states {
 			if seen[s] {
 				continue
 			}
-			if s.Group[pair.k] != pair.v {
+			if s.AlertKey.Group()[pair.k] != pair.v {
 				continue
 			}
 			seen[s] = true
-			group = append(group, s.AlertKey())
+			group = append(group, s.AlertKey)
 		}
 		if len(group) > 0 {
 			groups[fmt.Sprintf("{%s=%s}", pair.k, pair.v)] = group
 		}
 	}
 	// alerts
-	for {
-		if len(seen) == len(states) {
-			break
+	groupedByAlert := map[string]models.AlertKeys{}
+	for _, s := range states {
+		if seen[s] {
+			continue
 		}
-		var group expr.AlertKeys
-		for _, s := range states {
-			if seen[s] {
-				continue
+		groupedByAlert[s.Alert] = append(groupedByAlert[s.Alert], s.AlertKey)
+	}
+	for a, aks := range groupedByAlert {
+		if len(aks) >= minGroup {
+			group := models.AlertKeys{}
+			for _, ak := range aks {
+				group = append(group, ak)
 			}
-			if group == nil || s.AlertKey().Name() == group[0].Name() {
-				group = append(group, s.AlertKey())
-				seen[s] = true
-			}
+			groups[a] = group
 		}
-		if len(group) > 0 {
-			groups[group[0].Name()] = group
+	}
+	// ungrouped
+	for _, s := range states {
+		if seen[s] || len(groupedByAlert[s.Alert]) >= minGroup {
+			continue
 		}
+		groups[string(s.AlertKey)] = models.AlertKeys{s.AlertKey}
 	}
 	return groups
 }
 
-func (states States) Copy() States {
-	newStates := make(States, len(states))
-	for ak, st := range states {
-		newStates[ak] = st.Copy()
+func (s *Schedule) GetOpenStates() (States, error) {
+	incidents, err := s.DataAccess.State().GetAllOpenIncidents()
+	if err != nil {
+		return nil, err
 	}
-	return newStates
-}
-
-func (s *Schedule) GetOpenStates() States {
-	s.Lock("GetOpenStates")
-	defer s.Unlock()
-	states := s.status.Copy()
-	for k, state := range states {
-		if !state.Open {
-			delete(states, k)
-		}
+	states := make(States, len(incidents))
+	for _, inc := range incidents {
+		states[inc.AlertKey] = inc
 	}
-	return states
+	return states, nil
 }
 
 type StateGroup struct {
-	Active   bool `json:",omitempty"`
-	Status   Status
-	Silenced bool
-	IsError  bool          `json:",omitempty"`
-	Subject  string        `json:",omitempty"`
-	Alert    string        `json:",omitempty"`
-	AlertKey expr.AlertKey `json:",omitempty"`
-	Ago      string        `json:",omitempty"`
-	State    *State        `json:",omitempty"`
-	Children []*StateGroup `json:",omitempty"`
+	Active        bool `json:",omitempty"`
+	Status        models.Status
+	CurrentStatus models.Status
+	Silenced      bool
+	IsError       bool                  `json:",omitempty"`
+	Subject       string                `json:",omitempty"`
+	Alert         string                `json:",omitempty"`
+	AlertKey      models.AlertKey       `json:",omitempty"`
+	Ago           string                `json:",omitempty"`
+	State         *models.IncidentState `json:",omitempty"`
+	Children      []*StateGroup         `json:",omitempty"`
 }
 
 type StateGroups struct {
@@ -356,7 +360,7 @@ type StateGroups struct {
 }
 
 func (s *Schedule) MarshalGroups(T miniprofiler.Timer, filter string) (*StateGroups, error) {
-	var silenced map[expr.AlertKey]Silence
+	var silenced SilenceTester
 	T.Step("Silenced", func(miniprofiler.Timer) {
 		silenced = s.Silenced()
 	})
@@ -367,28 +371,30 @@ func (s *Schedule) MarshalGroups(T miniprofiler.Timer, filter string) (*StateGro
 		TimeAndDate: s.Conf.TimeAndDate,
 	}
 	t.FailingAlerts, t.UnclosedErrors = s.getErrorCounts()
-	s.Lock("MarshallGroups")
-	defer s.Unlock()
 	T.Step("Setup", func(miniprofiler.Timer) {
 		matches, err2 := makeFilter(filter)
 		if err2 != nil {
 			err = err2
 			return
 		}
-		for k, v := range s.status {
-			if !v.Open {
-				continue
-			}
+		status2, err2 := s.GetOpenStates()
+		if err2 != nil {
+			err = err2
+			return
+		}
+		for k, v := range status2 {
 			a := s.Conf.Alerts[k.Name()]
 			if a == nil {
-				err = fmt.Errorf("unknown alert %s", k.Name())
-				return
+				slog.Errorf("unknown alert %s. Force closing.", k.Name())
+				if err2 = s.Action("bosun", "closing because alert doesn't exist.", models.ActionForceClose, k); err2 != nil {
+					slog.Error(err2)
+				}
+				continue
 			}
 			if matches(s.Conf, a, v) {
 				status[k] = v
 			}
 		}
-
 	})
 	if err != nil {
 		return nil, err
@@ -400,30 +406,24 @@ func (s *Schedule) MarshalGroups(T miniprofiler.Timer, filter string) (*StateGro
 		for tuple, states := range groups {
 			var grouped []*StateGroup
 			switch tuple.Status {
-			case StWarning, StCritical, StUnknown:
-				var sets map[string]expr.AlertKeys
+			case models.StWarning, models.StCritical, models.StUnknown:
+				var sets map[string]models.AlertKeys
 				T.Step(fmt.Sprintf("GroupSets (%d): %v", len(states), tuple), func(T miniprofiler.Timer) {
-					sets = states.GroupSets()
+					sets = states.GroupSets(s.Conf.MinGroupSize)
 				})
 				for name, group := range sets {
 					g := StateGroup{
-						Active:   tuple.Active,
-						Status:   tuple.Status,
-						Silenced: tuple.Silenced,
-						Subject:  fmt.Sprintf("%s - %s", tuple.Status, name),
+						Active:        tuple.Active,
+						Status:        tuple.Status,
+						CurrentStatus: tuple.CurrentStatus,
+						Silenced:      tuple.Silenced,
+						Subject:       fmt.Sprintf("%s - %s", tuple.Status, name),
 					}
 					for _, ak := range group {
-						st := s.status[ak].Copy()
-						// remove some of the larger bits of state to reduce wire size
+						st := status[ak]
 						st.Body = ""
-						st.EmailBody = []byte{}
-						if len(st.History) > 1 {
-							st.History = st.History[len(st.History)-1:]
-						}
-						if len(st.Actions) > 1 {
-							st.Actions = st.Actions[len(st.Actions)-1:]
-						}
-
+						st.EmailBody = nil
+						st.Attachments = nil
 						g.Children = append(g.Children, &StateGroup{
 							Active:   tuple.Active,
 							Status:   tuple.Status,
@@ -511,12 +511,10 @@ func Close() {
 }
 
 func (s *Schedule) Close() {
-	s.save()
-	s.Lock("Close")
-	if s.db != nil {
-		s.db.Close()
+	err := s.Search.BackupLast()
+	if err != nil {
+		slog.Error(err)
 	}
-	s.Unlock()
 }
 
 const pingFreq = time.Second * 15
@@ -576,672 +574,113 @@ func init() {
 		"The running count of actions performed by individual users (Closed alert, Acknowledged alert, etc).")
 }
 
-type State struct {
-	*Result
-
-	// Most recent last.
-	History      []Event  `json:",omitempty"`
-	Actions      []Action `json:",omitempty"`
-	Touched      time.Time
-	Alert        string // helper data since AlertKeys don't serialize to JSON well
-	Tags         string // string representation of Group
-	Group        opentsdb.TagSet
-	Subject      string
-	Body         string
-	EmailBody    []byte             `json:"-"`
-	EmailSubject []byte             `json:"-"`
-	Attachments  []*conf.Attachment `json:"-"`
-	NeedAck      bool
-	Open         bool
-	Forgotten    bool
-	Unevaluated  bool
-	LastLogTime  time.Time
-}
-
-func (s *State) Copy() *State {
-	newState := &State{
-		History:      s.History, //history and actions safe to copy as long as elements are not modified. Appending will not affect original state.
-		Actions:      s.Actions,
-		Touched:      s.Touched,
-		Alert:        s.Alert,
-		Tags:         s.Tags,
-		Group:        s.Group.Copy(),
-		Subject:      s.Subject,
-		Body:         s.Body,
-		EmailBody:    s.EmailBody,
-		EmailSubject: s.EmailSubject,
-		Attachments:  s.Attachments,
-		NeedAck:      s.NeedAck,
-		Open:         s.Open,
-		Forgotten:    s.Forgotten,
-		Unevaluated:  s.Unevaluated,
-		LastLogTime:  s.LastLogTime,
+func (s *Schedule) Action(user, message string, t models.ActionType, ak models.AlertKey) error {
+	if err := collect.Add("actions", opentsdb.TagSet{"user": user, "alert": ak.Name(), "type": t.String()}, 1); err != nil {
+		slog.Errorln(err)
 	}
-	newState.Result = s.Result
-	return newState
-}
-
-func (s *State) AlertKey() expr.AlertKey {
-	return expr.NewAlertKey(s.Alert, s.Group)
-}
-
-func (s *State) Status() Status {
-	return s.Last().Status
-}
-
-// AbnormalEvent returns the most recent non-normal event, or nil if none found.
-func (s *State) AbnormalEvent() *Event {
-	for i := len(s.History) - 1; i >= 0; i-- {
-		if ev := s.History[i]; ev.Status > StNormal {
-			return &ev
-		}
+	st, err := s.DataAccess.State().GetLatestIncident(ak)
+	if err != nil {
+		return err
 	}
-	return nil
-}
-
-// AbnormalStatus returns the most recent non-normal status, or StNone if none
-// found.
-func (s *State) AbnormalStatus() Status {
-	ev := s.AbnormalEvent()
-	if ev != nil {
-		return ev.Status
-	}
-	return StNone
-}
-
-func (s *State) IsActive() bool {
-	return s.Status() > StNormal
-}
-
-func (s *State) Action(user, message string, t ActionType, timestamp time.Time) {
-	s.Actions = append(s.Actions, Action{
-		User:    user,
-		Message: message,
-		Type:    t,
-		Time:    timestamp,
-	})
-}
-
-func (s *Schedule) Action(user, message string, t ActionType, ak expr.AlertKey) error {
-	s.Lock("Action")
-	defer s.Unlock()
-	st := s.status[ak]
 	if st == nil {
 		return fmt.Errorf("no such alert key: %v", ak)
 	}
-	ack := func() {
-		delete(s.Notifications, ak)
-		st.NeedAck = false
-	}
-	isUnknown := st.AbnormalStatus() == StUnknown
-	timestamp := time.Now().UTC()
+	isUnknown := st.LastAbnormalStatus == models.StUnknown
+	timestamp := utcNow()
 	switch t {
-	case ActionAcknowledge:
+	case models.ActionAcknowledge:
 		if !st.NeedAck {
 			return fmt.Errorf("alert already acknowledged")
 		}
 		if !st.Open {
 			return fmt.Errorf("cannot acknowledge closed alert")
 		}
-		ack()
-	case ActionClose:
-		if st.NeedAck {
-			ack()
+		st.NeedAck = false
+		if err := s.DataAccess.Notifications().ClearNotifications(ak); err != nil {
+			return err
 		}
+	case models.ActionClose:
 		if st.IsActive() {
 			return fmt.Errorf("cannot close active alert")
 		}
+		fallthrough
+	case models.ActionForceClose:
 		st.Open = false
-		last := st.Last()
-		if last.IncidentId != 0 {
-			s.incidentLock.Lock()
-			if incident, ok := s.Incidents[last.IncidentId]; ok {
-				incident.End = &timestamp
-			}
-			s.incidentLock.Unlock()
-		}
-	case ActionForget:
+		st.End = &timestamp
+	case models.ActionForget:
 		if !isUnknown {
 			return fmt.Errorf("can only forget unknowns")
 		}
-		if st.NeedAck {
-			ack()
-		}
-		st.Open = false
-		st.Forgotten = true
-		delete(s.status, ak)
+		fallthrough
+	case models.ActionPurge:
+		return s.DataAccess.State().Forget(ak)
 	default:
 		return fmt.Errorf("unknown action type: %v", t)
 	}
-	st.Action(user, message, t, timestamp)
 	// Would like to also track the alert group, but I believe this is impossible because any character
 	// that could be used as a delimiter could also be a valid tag key or tag value character
 	if err := collect.Add("actions", opentsdb.TagSet{"user": user, "alert": ak.Name(), "type": t.String()}, 1); err != nil {
 		slog.Errorln(err)
 	}
-	return nil
-}
-
-func (s *State) Touch() {
-	s.Touched = time.Now().UTC()
-	s.Forgotten = false
-}
-
-// Append appends status to the history if the status is different than the
-// latest status. Returns the previous status.
-func (s *State) Append(event *Event) Status {
-	last := s.Last()
-	if len(s.History) == 0 || last.Status != event.Status {
-		s.History = append(s.History, *event)
-	}
-	return last.Status
-}
-
-func (s *State) Last() Event {
-	if len(s.History) == 0 {
-		return Event{}
-	}
-	return s.History[len(s.History)-1]
-}
-
-type Event struct {
-	Warn, Crit  *Result
-	Status      Status
-	Time        time.Time
-	Unevaluated bool
-	IncidentId  uint64
-}
-
-type Result struct {
-	*expr.Result
-	Expr string
-}
-
-func (r *Result) Copy() *Result {
-	return &Result{r.Result, r.Expr}
-}
-
-type Status int
-
-const (
-	StNone Status = iota
-	StNormal
-	StWarning
-	StCritical
-	StUnknown
-)
-
-func (s Status) String() string {
-	switch s {
-	case StNormal:
-		return "normal"
-	case StWarning:
-		return "warning"
-	case StCritical:
-		return "critical"
-	case StUnknown:
-		return "unknown"
-	default:
-		return "none"
-	}
-}
-
-func (s Status) MarshalJSON() ([]byte, error) {
-	return json.Marshal(s.String())
-}
-
-func (s Status) IsNormal() bool   { return s == StNormal }
-func (s Status) IsWarning() bool  { return s == StWarning }
-func (s Status) IsCritical() bool { return s == StCritical }
-func (s Status) IsUnknown() bool  { return s == StUnknown }
-
-type Action struct {
-	User    string
-	Message string
-	Time    time.Time
-	Type    ActionType
-}
-
-type ActionType int
-
-const (
-	ActionNone ActionType = iota
-	ActionAcknowledge
-	ActionClose
-	ActionForget
-)
-
-func (a ActionType) String() string {
-	switch a {
-	case ActionAcknowledge:
-		return "Acknowledged"
-	case ActionClose:
-		return "Closed"
-	case ActionForget:
-		return "Forgotten"
-	default:
-		return "none"
-	}
-}
-
-func (a ActionType) MarshalJSON() ([]byte, error) {
-	return json.Marshal(a.String())
-}
-
-type Incident struct {
-	Id       uint64
-	Start    time.Time
-	End      *time.Time
-	AlertKey expr.AlertKey
-}
-
-func (s *Schedule) createIncident(ak expr.AlertKey, start time.Time) *Incident {
-	s.incidentLock.Lock()
-	defer s.incidentLock.Unlock()
-	s.maxIncidentId++
-	id := s.maxIncidentId
-	incident := &Incident{
-		Id:       id,
-		Start:    start,
-		AlertKey: ak,
-	}
-
-	s.Incidents[id] = incident
-	return incident
-}
-
-type incidentList []*Incident
-
-func (i incidentList) Len() int { return len(i) }
-func (i incidentList) Less(a int, b int) bool {
-	if i[a].Start.Before(i[b].Start) {
-		return true
-	}
-	return i[a].AlertKey < i[b].AlertKey
-}
-func (i incidentList) Swap(a int, b int) { i[a], i[b] = i[b], i[a] }
-
-func (s *Schedule) createHistoricIncidents() {
-	incidents := make(incidentList, 0)
-	indexes := make(map[*Incident]int)
-	s.Incidents = make(map[uint64]*Incident)
-	// 1. Create all incidents, but don't assign ids or link events yet.
-	for ak, state := range s.status {
-		var currentIncident *Incident
-		for i, ev := range state.History {
-			if currentIncident != nil {
-				if currentIncident.End == nil || ev.Time.Before(*currentIncident.End) {
-					// Continue open incident
-					continue
-				} else {
-					// End incident after end time
-					currentIncident = nil
-				}
-			}
-			if ev.Status == StNormal {
-				continue
-			}
-			// New incident
-			currentIncident = &Incident{AlertKey: ak, Start: ev.Time}
-			indexes[currentIncident] = i
-			incidents = append(incidents, currentIncident)
-			// Find end time for incident
-			for _, action := range state.Actions {
-				if action.Type == ActionClose && action.Time.After(ev.Time) {
-					end := action.Time
-					currentIncident.End = &end
-					break
-				}
-			}
-		}
-	}
-	// 2. Sort incidents
-	sort.Sort(incidents)
-	// 3. Assign ids and link events to appropriate ids
-	for _, incident := range incidents {
-		s.maxIncidentId++
-		incident.Id = s.maxIncidentId
-		// Find events and mark them
-		state := s.status[incident.AlertKey]
-		for idx := indexes[incident]; idx < len(state.History); idx++ {
-			ev := state.History[idx]
-			if incident.End == nil || ev.Time.Before(*incident.End) {
-				ev.IncidentId = incident.Id
-				state.History[idx] = ev
-			} else {
-				break
-			}
-		}
-		s.Incidents[incident.Id] = incident
-	}
-}
-
-func (s *Schedule) GetIncidents(alert string, from, to time.Time) []*Incident {
-	s.incidentLock.Lock()
-	defer s.incidentLock.Unlock()
-	list := []*Incident{}
-	for _, i := range s.Incidents {
-		if alert != "" && i.AlertKey.Name() != alert {
-			continue
-		}
-		if i.Start.Before(from) || i.Start.After(to) {
-			continue
-		}
-		list = append(list, i)
-	}
-	return list
-}
-
-func (s *Schedule) GetIncident(id uint64) (*Incident, error) {
-	s.incidentLock.Lock()
-	incident, ok := s.Incidents[id]
-	s.incidentLock.Unlock()
-	if !ok {
-		return nil, fmt.Errorf("incident %d not found", id)
-	}
-	return incident, nil
-}
-
-func (s *Schedule) GetIncidentEvents(id uint64) (*Incident, []Event, []Action, error) {
-	s.incidentLock.Lock()
-	incident, ok := s.Incidents[id]
-	s.incidentLock.Unlock()
-	if !ok {
-		return nil, nil, nil, fmt.Errorf("incident %d not found", id)
-	}
-	list := []Event{}
-	state := s.GetStatus(incident.AlertKey)
-	if state == nil {
-		return incident, list, nil, nil
-	}
-	found := false
-	for _, e := range state.History {
-		if e.IncidentId == id {
-			found = true
-			list = append(list, e)
-		} else if found {
-			break
-		}
-	}
-	actions := []Action{}
-	for _, a := range state.Actions {
-		if a.Time.After(incident.Start) && (incident.End == nil || a.Time.Before(*incident.End) || a.Time.Equal(*incident.End)) {
-			actions = append(actions, a)
-		}
-	}
-	return incident, list, actions, nil
+	st.Actions = append(st.Actions, models.Action{
+		Message: message,
+		Time:    timestamp,
+		Type:    t,
+		User:    user,
+	})
+	_, err = s.DataAccess.State().UpdateIncidentState(st)
+	return err
 }
 
 type IncidentStatus struct {
-	IncidentID uint64
-	AlertKey   expr.AlertKey
-	Status     Status
-	Subject    string
-	Silenced   bool
-}
-
-func (s *Schedule) Host(filter string) (map[string]*HostData, error) {
-	hosts := make(map[string]*HostData)
-	allHosts, err := s.Search.TagValuesByTagKey("host", time.Hour*7*24)
-	if err != nil {
-		return nil, err
-	}
-	for _, h := range allHosts {
-		hosts[h] = newHostData()
-	}
-	states := s.GetOpenStates()
-	silences := s.Silenced()
-	for name, host := range hosts {
-		host.Name = name
-		for ak, state := range states {
-			if stateHost, ok := state.Group["host"]; !ok {
-				continue
-			} else if stateHost != host.Name {
-				continue
-			}
-			_, silenced := silences[ak]
-			is := IncidentStatus{
-				IncidentID: state.Last().IncidentId,
-				AlertKey:   state.AlertKey(),
-				Status:     state.Status(),
-				Subject:    state.Subject,
-				Silenced:   silenced,
-			}
-			host.OpenIncidentIDs = append(host.OpenIncidentIDs, is)
-		}
-		md, err := s.GetMetadata("", opentsdb.TagSet{"host": name})
-		if err != nil {
-			slog.Error(err)
-		}
-		for _, m := range md {
-			var iface *HostInterface
-			if name := m.Tags["iface"]; name != "" {
-				if host.Interfaces[name] == nil {
-					h := new(HostInterface)
-					host.Interfaces[name] = h
-				}
-				iface = host.Interfaces[name]
-			}
-			switch val := m.Value.(type) {
-			case string:
-				switch m.Name {
-				case "addr":
-					if iface != nil {
-						iface.IPAddresses = append(iface.IPAddresses, val)
-					}
-				case "description", "alias":
-					if iface != nil {
-						iface.Description = val
-					}
-				case "mac":
-					if iface != nil {
-						iface.MAC = val
-					}
-				case "manufacturer":
-					host.Manufacturer = val
-				case "master":
-					if iface != nil {
-						iface.Master = val
-					}
-				case "memory":
-					if name := m.Tags["name"]; name != "" {
-						host.Memory.Modules[name] = val
-					}
-				case "model":
-					host.Model = val
-				case "name":
-					if iface != nil {
-						iface.Name = val
-					}
-				case "processor":
-					if name := m.Tags["name"]; name != "" {
-						host.CPU.Processors[name] = val
-					}
-				case "serialNumber":
-					host.SerialNumber = val
-				case "version":
-					host.OS.Version = val
-				case "versionCaption", "uname":
-					host.OS.Caption = val
-				}
-			case float64:
-				switch m.Name {
-				case "memoryTotal":
-					host.Memory.Total = int64(val)
-				case "speed":
-					if iface != nil {
-						iface.LinkSpeed = int64(val)
-					}
-				}
-			}
-		}
-	}
-	return hosts, nil
-}
-
-type HostInterface struct {
-	Description string   `json:",omitempty"`
-	IPAddresses []string `json:",omitempty"`
-	Inbps       int64    `json:",omitempty"`
-	LinkSpeed   int64    `json:",omitempty"`
-	MAC         string   `json:",omitempty"`
-	Master      string   `json:",omitempty"`
-	Name        string   `json:",omitempty"`
-	Outbps      int64    `json:",omitempty"`
-}
-
-func newHostData() *HostData {
-	hd := &HostData{}
-	hd.CPU.Processors = make(map[string]string)
-	hd.Interfaces = make(map[string]*HostInterface)
-	hd.Memory.Modules = make(map[string]string)
-	hd.OpenIncidentIDs = make([]IncidentStatus, 0)
-	return hd
-}
-
-type HostData struct {
-	CPU struct {
-		Logical    int64             `json:",omitempty"`
-		Physical   int64             `json:",omitempty"`
-		Used       float64           `json:",omitempty"`
-		Processors map[string]string `json:",omitempty"`
-	}
-	OpenIncidentIDs []IncidentStatus
-	Interfaces      map[string]*HostInterface
-	LastBoot        int64  `json:",omitempty"`
-	LastUpdate      int64  `json:",omitempty"`
-	Manufacturer    string `json:",omitempty"`
-	Memory          struct {
-		Modules map[string]string `json:",omitempty"`
-		Total   int64             `json:",omitempty"`
-		Used    int64             `json:",omitempty"`
-	}
-	Model string `json:",omitempty"`
-	Name  string `json:",omitempty"`
-	OS    struct {
-		Caption string `json:",omitempty"`
-		Version string `json:",omitempty"`
-	}
-	SerialNumber string `json:",omitempty"`
-}
-
-//Alert Status is the current state of a single alert
-type AlertStatus struct {
-	Success bool
-	Errors  []*AlertError
-}
-
-type AlertError struct {
-	FirstTime, LastTime time.Time
-	Count               int
-	Message             string
+	IncidentID         int64
+	Active             bool
+	AlertKey           models.AlertKey
+	Status             models.Status
+	StatusTime         int64
+	Subject            string
+	Silenced           bool
+	LastAbnormalStatus models.Status
+	LastAbnormalTime   int64
+	NeedsAck           bool
 }
 
 func (s *Schedule) AlertSuccessful(name string) bool {
-	s.alertStatusLock.Lock()
-	defer s.alertStatusLock.Unlock()
-	if as, ok := s.AlertStatuses[name]; ok {
-		return as.Success
+	b, err := s.DataAccess.Errors().IsAlertFailing(name)
+	if err != nil {
+		slog.Error(err)
+		b = true
 	}
-	return true
+	return !b
 }
 
-func (s *Schedule) markAlertError(name string, err error) {
-	s.alertStatusLock.Lock()
-	defer s.alertStatusLock.Unlock()
-	as, ok := s.AlertStatuses[name]
-	if !ok {
-		as = &AlertStatus{}
-		s.AlertStatuses[name] = as
+func (s *Schedule) markAlertError(name string, e error) {
+	d := s.DataAccess.Errors()
+	if err := d.MarkAlertFailure(name, e.Error()); err != nil {
+		slog.Error(err)
+		return
 	}
-	// if it succeeded prior to now, make a new error event.
-	// else if message is same as last, coalesce together.
-	// else append new event
-	now := time.Now().UTC().Truncate(time.Second)
-	newError := func() {
-		as.Errors = append(as.Errors, &AlertError{
-			FirstTime: now,
-			LastTime:  now,
-			Count:     1,
-			Message:   err.Error(),
-		})
-	}
-	if as.Success || len(as.Errors) == 0 {
-		newError()
-	} else {
-		last := as.Errors[len(as.Errors)-1]
-		if err.Error() == last.Message {
-			last.Count++
-			last.LastTime = now
-		} else {
-			newError()
-		}
-	}
-	as.Success = false
+
 }
 
 func (s *Schedule) markAlertSuccessful(name string) {
-	s.alertStatusLock.Lock()
-	defer s.alertStatusLock.Unlock()
-	as, ok := s.AlertStatuses[name]
-	if !ok {
-		as = &AlertStatus{}
-		s.AlertStatuses[name] = as
+	if err := s.DataAccess.Errors().MarkAlertSuccess(name); err != nil {
+		slog.Error(err)
 	}
-	as.Success = true
 }
 
-func (s *Schedule) ClearErrorLine(alert string, startTime time.Time) {
-	s.alertStatusLock.Lock()
-	defer s.alertStatusLock.Unlock()
-	if as, ok := s.AlertStatuses[alert]; ok {
-		newErrors := make([]*AlertError, 0, len(as.Errors))
-		for _, err := range as.Errors {
-			if err.FirstTime != startTime {
-				newErrors = append(newErrors, err)
-			}
-		}
-		as.Errors = newErrors
-		if len(as.Errors) == 0 {
-			as.Success = true
-		}
+func (s *Schedule) ClearErrors(alert string) error {
+	if alert == "all" {
+		return s.DataAccess.Errors().ClearAll()
 	}
+	return s.DataAccess.Errors().ClearAlert(alert)
 }
 
 func (s *Schedule) getErrorCounts() (failing, total int) {
-	failing = 0
-	total = 0
-	s.alertStatusLock.Lock()
-	defer s.alertStatusLock.Unlock()
-	for _, as := range s.AlertStatuses {
-		if !as.Success {
-			failing++
-		}
-		for _, err := range as.Errors {
-			total += err.Count
-		}
+	var err error
+	failing, total, err = s.DataAccess.Errors().GetFailingAlertCounts()
+	if err != nil {
+		slog.Error(err)
 	}
 	return
-}
-
-func (s *Schedule) GetErrorHistory() map[string]*AlertStatus {
-	s.alertStatusLock.Lock()
-	defer s.alertStatusLock.Unlock()
-	mapCopy := make(map[string]*AlertStatus, len(s.AlertStatuses))
-	for name, as := range s.AlertStatuses {
-		asCopy := &AlertStatus{
-			Success: as.Success,
-			Errors:  make([]*AlertError, len(as.Errors)),
-		}
-		for i, err := range as.Errors {
-			asCopy.Errors[i] = &AlertError{
-				Count:     err.Count,
-				FirstTime: err.FirstTime.UTC(),
-				LastTime:  err.LastTime.UTC(),
-				Message:   err.Message,
-			}
-		}
-		mapCopy[name] = asCopy
-	}
-	return mapCopy
 }

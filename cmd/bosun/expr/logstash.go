@@ -7,10 +7,11 @@ import (
 	"strings"
 	"time"
 
-	"bosun.org/_third_party/github.com/MiniProfiler/go/miniprofiler"
-	"bosun.org/_third_party/github.com/olivere/elastic"
 	"bosun.org/cmd/bosun/expr/parse"
+	"bosun.org/models"
 	"bosun.org/opentsdb"
+	"github.com/MiniProfiler/go/miniprofiler"
+	"github.com/olivere/elastic"
 )
 
 // This uses a global client since the elastic client handles connections
@@ -20,17 +21,26 @@ var lsClient *elastic.Client
 // logstash. They are only loaded when the elastic hosts are set in the config file
 var LogstashElastic = map[string]parse.Func{
 	"lscount": {
-		Args:   []parse.FuncType{parse.TypeString, parse.TypeString, parse.TypeString, parse.TypeString, parse.TypeString, parse.TypeString},
-		Return: parse.TypeSeriesSet,
+		Args:   []models.FuncType{models.TypeString, models.TypeString, models.TypeString, models.TypeString, models.TypeString, models.TypeString},
+		Return: models.TypeSeriesSet,
 		Tags:   logstashTagQuery,
 		F:      LSCount,
 	},
 	"lsstat": {
-		Args:   []parse.FuncType{parse.TypeString, parse.TypeString, parse.TypeString, parse.TypeString, parse.TypeString, parse.TypeString, parse.TypeString, parse.TypeString},
-		Return: parse.TypeSeriesSet,
+		Args:   []models.FuncType{models.TypeString, models.TypeString, models.TypeString, models.TypeString, models.TypeString, models.TypeString, models.TypeString, models.TypeString},
+		Return: models.TypeSeriesSet,
 		Tags:   logstashTagQuery,
 		F:      LSStat,
 	},
+}
+
+func logstashTagQuery(args []parse.Node) (parse.Tags, error) {
+	n := args[1].(*parse.StringNode)
+	t := make(parse.Tags)
+	for _, s := range strings.Split(n.Text, ",") {
+		t[strings.Split(s, ":")[0]] = struct{}{}
+	}
+	return t, nil
 }
 
 // This is an array of Logstash hosts and exists as a type for something to attach
@@ -164,8 +174,9 @@ func (e *LogstashElasticHosts) GenIndices(r *LogstashRequest) (string, error) {
 // filter is an Elastic regexp query that can be applied to any field. It is in
 // the same format as the keystring argument.
 // interval is in the format of an opentsdb time duration, and tells elastic
-// what the bucket size should be. The result will be normalized to a per second
-// rate regardless of what this is set to.
+// what the bucket size should be.
+// Note: The results used to be normalized to a per second rate. This is no
+// longer done as it resulted in erroneous extrapolations.
 // sduration and end duration are the time bounds for the query and are in
 // opentsdb's relative time format:
 // http://opentsdb.net/docs/build/html/user_guide/query/dates.html
@@ -191,7 +202,7 @@ func LSStat(e *State, T miniprofiler.Timer, index_root, keystring, filter, field
 	return LSDateHistogram(e, T, index_root, keystring, filter, interval, sduration, eduration, field, rstat, 0)
 }
 
-// LSDateHistorgram builds the aggregation query using subaggregations. The result is a grouped timer series
+// LSDateHistorgram builds the aggregation query using subaggregations. The result is a grouped time series
 // that Bosun can understand
 func LSDateHistogram(e *State, T miniprofiler.Timer, index_root, keystring, filter, interval, sduration, eduration, stat_field, rstat string, size int) (r *Results, err error) {
 	r = new(Results)
@@ -199,11 +210,8 @@ func LSDateHistogram(e *State, T miniprofiler.Timer, index_root, keystring, filt
 	if err != nil {
 		return nil, err
 	}
-	ts := elastic.NewDateHistogramAggregation().Field("@timestamp").Interval(strings.Replace(interval, "M", "n", -1)).MinDocCount(0)
-	ds, err := opentsdb.ParseDuration(interval)
-	if err != nil {
-		return nil, err
-	}
+	// Extended bounds and min doc count are required to get values back when the bucket value is 0
+	ts := elastic.NewDateHistogramAggregation().Field("@timestamp").Interval(strings.Replace(interval, "M", "n", -1)).MinDocCount(0).ExtendedBoundsMin(req.Start).ExtendedBoundsMax(req.End)
 	if stat_field != "" {
 		ts = ts.SubAggregation("stats", elastic.NewExtendedStatsAggregation().Field(stat_field))
 		switch rstat {
@@ -224,7 +232,7 @@ func LSDateHistogram(e *State, T miniprofiler.Timer, index_root, keystring, filt
 		}
 		series := make(Series)
 		for _, v := range ts.Buckets {
-			val := processBucketItem(v, rstat, ds)
+			val := processBucketItem(v, rstat)
 			if val != nil {
 				series[time.Unix(v.Key/1000, 0).UTC()] = *val
 			}
@@ -261,7 +269,7 @@ func LSDateHistogram(e *State, T miniprofiler.Timer, index_root, keystring, filt
 			}
 			series := make(Series)
 			for _, v := range ts.Buckets {
-				val := processBucketItem(v, rstat, ds)
+				val := processBucketItem(v, rstat)
 				if val != nil {
 					series[time.Unix(v.Key/1000, 0).UTC()] = *val
 				}
@@ -305,7 +313,7 @@ func LSDateHistogram(e *State, T miniprofiler.Timer, index_root, keystring, filt
 	return r, nil
 }
 
-func processBucketItem(b *elastic.AggregationBucketHistogramItem, rstat string, ds opentsdb.Duration) *float64 {
+func processBucketItem(b *elastic.AggregationBucketHistogramItem, rstat string) *float64 {
 	if stats, found := b.ExtendedStats("stats"); found {
 		var val *float64
 		switch rstat {
@@ -326,7 +334,7 @@ func processBucketItem(b *elastic.AggregationBucketHistogramItem, rstat string, 
 		}
 		return val
 	}
-	v := float64(b.DocCount) / ds.Seconds()
+	v := float64(b.DocCount)
 	return &v
 }
 

@@ -20,7 +20,7 @@ var testData database.DataAccess
 
 func TestMain(m *testing.M) {
 	var closeF func()
-	testData, closeF = dbtest.StartTestRedis()
+	testData, closeF = dbtest.StartTestRedis(9991)
 	status := m.Run()
 	closeF()
 	os.Exit(status)
@@ -71,7 +71,7 @@ func TestRelay(t *testing.T) {
 	}
 	time.Sleep(time.Second)
 
-	m, _ := schedule.Search.UniqueMetrics()
+	m, _ := schedule.Search.UniqueMetrics(0)
 	sort.Strings(m)
 	if len(m) != 2 || m[0] != "gzip-works" || m[1] != "no-gzip-works" {
 		t.Errorf("bad um: %v", m)

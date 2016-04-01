@@ -13,7 +13,7 @@ import (
 var testSearch *Search
 
 func TestMain(m *testing.M) {
-	testData, closeF := dbtest.StartTestRedis()
+	testData, closeF := dbtest.StartTestRedis(9990)
 	testSearch = NewSearch(testData)
 	status := m.Run()
 	closeF()
@@ -42,7 +42,7 @@ func TestIndex(t *testing.T) {
 	}
 	testSearch.Index(mdp)
 	time.Sleep(1 * time.Second)
-	um, err := testSearch.UniqueMetrics()
+	um, err := testSearch.UniqueMetrics(0)
 	checkEqual(t, err, "metrics", []string{"os.cpu", "os.cpu2", "os.mem"}, um)
 
 	tagks, err := testSearch.TagKeysByMetric("os.cpu")

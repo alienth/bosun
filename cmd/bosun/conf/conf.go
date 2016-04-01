@@ -17,33 +17,39 @@ import (
 	ttemplate "text/template"
 	"time"
 
-	"bosun.org/_third_party/github.com/MiniProfiler/go/miniprofiler"
-	"bosun.org/_third_party/github.com/influxdb/influxdb/client"
 	"bosun.org/cmd/bosun/conf/parse"
 	"bosun.org/cmd/bosun/expr"
 	eparse "bosun.org/cmd/bosun/expr/parse"
 	"bosun.org/graphite"
+	"bosun.org/models"
 	"bosun.org/opentsdb"
 	"bosun.org/slog"
+	"github.com/MiniProfiler/go/miniprofiler"
+	"github.com/influxdata/influxdb/client"
 )
 
 type Conf struct {
 	Vars
-	Name             string        // Config file name
-	CheckFrequency   time.Duration // Time between alert checks: 5m
-	DefaultRunEvery  int           // Default number of check intervals to run each alert: 1
-	HTTPListen       string        // Web server listen address: :80
-	Hostname         string
-	RelayListen      string // OpenTSDB relay listen address: :4242
-	SMTPHost         string // SMTP address: ny-mail:25
-	SMTPUsername     string // SMTP username
-	SMTPPassword     string // SMTP password
-	Ping             bool
-	PingDuration     time.Duration // Duration from now to stop pinging hosts based on time since the host tag was touched
-	EmailFrom        string
-	StateFile        string
-	LedisDir         string
-	RedisHost        string
+	Name            string        // Config file name
+	CheckFrequency  time.Duration // Time between alert checks: 5m
+	DefaultRunEvery int           // Default number of check intervals to run each alert: 1
+	HTTPListen      string        // Web server listen address: :80
+	Hostname        string
+	RelayListen     string // OpenTSDB relay listen address: :4242
+	SMTPHost        string // SMTP address: ny-mail:25
+	SMTPUsername    string // SMTP username
+	SMTPPassword    string // SMTP password
+	Ping            bool
+	PingDuration    time.Duration // Duration from now to stop pinging hosts based on time since the host tag was touched
+	EmailFrom       string
+	StateFile       string
+	LedisDir        string
+	LedisBindAddr   string
+
+	RedisHost     string
+	RedisDb       int
+	RedisPassword string
+
 	TimeAndDate      []int // timeanddate.com cities list
 	ResponseLimit    int64
 	SearchSince      opentsdb.Duration
@@ -59,12 +65,19 @@ type Conf struct {
 	Quiet            bool
 	NoSleep          bool
 	ShortURLKey      string
+	InternetProxy    string
+	MinGroupSize     int
 
 	TSDBHost             string                    // OpenTSDB relay and query destination: ny-devtsdb04:4242
+	TSDBVersion          *opentsdb.Version         // If set to 2.2 , enable passthrough of wildcards and filters, and add support for groupby
 	GraphiteHost         string                    // Graphite query host: foo.bar.baz
 	GraphiteHeaders      []string                  // extra http headers when querying graphite.
-	LogstashElasticHosts expr.LogstashElasticHosts // CSV Elastic Hosts (All part of the same cluster) that stores logstash documents, i.e http://ny-elastic01:9200
+	LogstashElasticHosts expr.LogstashElasticHosts // CSV Elastic Hosts (All part of the same cluster) that stores logstash documents, i.e http://ny-elastic01:9200. Only works with elastc pre-v2, and expects the schema to be logstash's default.
+	ElasticHosts         expr.ElasticHosts         // CSV Elastic Hosts (All part of the same cluster), i.e http://ny-elastic01:9200. Only works with elastic v2+, and unlike logstash it is designed to be able to use various elastic schemas.
 	InfluxConfig         client.Config
+
+	AnnotateElasticHosts []string // CSV of Elastic Hosts, currently the only backend in annotate
+	AnnotateIndex        string   // name of index / table
 
 	tree            *parse.Tree
 	node            parse.Node
@@ -80,7 +93,7 @@ func (c *Conf) TSDBContext() opentsdb.Context {
 	if c.TSDBHost == "" {
 		return nil
 	}
-	return opentsdb.NewLimitContext(c.TSDBHost, c.ResponseLimit)
+	return opentsdb.NewLimitContext(c.TSDBHost, c.ResponseLimit, *c.TSDBVersion)
 }
 
 // GraphiteContext returns a Graphite context. A nil context is returned if
@@ -167,6 +180,10 @@ func (c *Conf) error(err error) {
 	c.errorf(err.Error())
 }
 
+func (c *Conf) AnnotateEnabled() bool {
+	return len(c.AnnotateElasticHosts) != 0
+}
+
 // errorf formats the error and terminates processing.
 func (c *Conf) errorf(format string, args ...interface{}) {
 	if c.node == nil {
@@ -237,10 +254,11 @@ type Alert struct {
 	Unknown          time.Duration
 	MaxLogFrequency  time.Duration
 	IgnoreUnknown    bool
+	UnknownsNormal   bool
 	UnjoinedOK       bool `json:",omitempty"`
 	Log              bool
 	RunEvery         int
-	returnType       eparse.FuncType
+	returnType       models.FuncType
 
 	template string
 	squelch  []string
@@ -313,6 +331,7 @@ type Notification struct {
 	Timeout      time.Duration
 	ContentType  string
 	RunOnActions bool
+	UseBody      bool
 
 	next      string
 	email     string
@@ -343,9 +362,12 @@ func New(name, text string) (c *Conf, err error) {
 		HTTPListen:       ":8070",
 		StateFile:        "bosun.state",
 		LedisDir:         "ledis_data",
+		LedisBindAddr:    "127.0.0.1:9565",
+		MinGroupSize:     5,
 		PingDuration:     time.Hour * 24,
 		ResponseLimit:    1 << 20, // 1MB
 		SearchSince:      opentsdb.Day * 3,
+		TSDBVersion:      &opentsdb.Version2_1,
 		UnknownThreshold: 5,
 		Vars:             make(map[string]string),
 		Templates:        make(map[string]*Template),
@@ -406,6 +428,20 @@ func (c *Conf) loadGlobal(p *parse.PairNode) {
 			v += ":4242"
 		}
 		c.TSDBHost = v
+	case "tsdbVersion":
+		sp := strings.Split(v, ".")
+		if len(sp) != 2 {
+			c.errorf("tsdbVersion must be in number.number form")
+		}
+		major, err := strconv.ParseInt(sp[0], 10, 64)
+		if err != nil {
+			c.errorf("error pasing opentsdb major version number %v: %v", sp[0], err)
+		}
+		minor, err := strconv.ParseInt(sp[1], 10, 64)
+		if err != nil {
+			c.errorf("error pasing opentsdb minor version number %v: %v", sp[1], err)
+		}
+		c.TSDBVersion = &opentsdb.Version{Major: major, Minor: minor}
 	case "graphiteHost":
 		c.GraphiteHost = v
 	case "graphiteHeader":
@@ -415,6 +451,8 @@ func (c *Conf) loadGlobal(p *parse.PairNode) {
 		c.GraphiteHeaders = append(c.GraphiteHeaders, v)
 	case "logstashElasticHosts":
 		c.LogstashElasticHosts = strings.Split(v, ",")
+	case "elasticHosts":
+		c.ElasticHosts = strings.Split(v, ",")
 	case "influxHost":
 		c.InfluxConfig.URL.Host = v
 		c.InfluxConfig.UserAgent = "bosun"
@@ -522,10 +560,32 @@ func (c *Conf) loadGlobal(p *parse.PairNode) {
 		}
 	case "shortURLKey":
 		c.ShortURLKey = v
+	case "internetProxy":
+		c.InternetProxy = v
 	case "ledisDir":
 		c.LedisDir = v
+	case "ledisBindAddr":
+		c.LedisBindAddr = v
 	case "redisHost":
 		c.RedisHost = v
+	case "redisPassword":
+		c.RedisPassword = v
+	case "redisDb":
+		i, err := strconv.Atoi(v)
+		if err != nil {
+			c.error(err)
+		}
+		c.RedisDb = i
+	case "annotateElasticHosts":
+		c.AnnotateElasticHosts = strings.Split(v, ",")
+	case "annotationIndex":
+		c.AnnotateIndex = v
+	case "minGroupSize":
+		i, err := strconv.Atoi(v)
+		if err != nil {
+			c.error(err)
+		}
+		c.MinGroupSize = i
 	default:
 		if !strings.HasPrefix(k, "$") {
 			c.errorf("unknown key %s", k)
@@ -664,7 +724,7 @@ func (c *Conf) loadLookup(s *parse.SectionNode) {
 				Def:  n.RawText,
 				Name: n.Name.Text,
 				ExprEntry: &ExprEntry{
-					AlertKey: expr.NewAlertKey("", tags),
+					AlertKey: models.NewAlertKey("", tags),
 					Values:   make(map[string]string),
 				},
 			}
@@ -885,6 +945,8 @@ func (c *Conf) loadAlert(s *parse.SectionNode) {
 			a.UnjoinedOK = true
 		case "ignoreUnknown":
 			a.IgnoreUnknown = true
+		case "unknownIsNormal":
+			a.UnknownsNormal = true
 		case "log":
 			a.Log = true
 		case "runEvery":
@@ -905,7 +967,7 @@ func (c *Conf) loadAlert(s *parse.SectionNode) {
 		c.errorf("neither crit or warn specified")
 	}
 	var tags eparse.Tags
-	var ret eparse.FuncType
+	var ret models.FuncType
 	if a.Crit != nil {
 		ctags, err := a.Crit.Root.Tags()
 		if err != nil {
@@ -1060,6 +1122,8 @@ func (c *Conf) loadNotification(s *parse.SectionNode) {
 			n.Body = tmpl
 		case "runOnActions":
 			n.RunOnActions = v == "true"
+		case "useBody":
+			n.UseBody = v == "true"
 		default:
 			c.errorf("unknown key %s", k)
 		}
@@ -1157,7 +1221,7 @@ func (c *Conf) NewExpr(s string) *expr.Expr {
 		c.error(err)
 	}
 	switch exp.Root.Return() {
-	case eparse.TypeNumberSet, eparse.TypeScalar:
+	case models.TypeNumberSet, models.TypeScalar:
 		break
 	default:
 		c.errorf("expression must return a number")
@@ -1275,7 +1339,7 @@ func (c *Conf) Funcs() map[string]eparse.Func {
 		if err != nil {
 			return nil, err
 		}
-		if a.returnType != eparse.TypeNumberSet {
+		if a.returnType != models.TypeNumberSet {
 			return nil, fmt.Errorf("alert requires a number-returning expression (got %v)", a.returnType)
 		}
 		return e.Root.Tags()
@@ -1283,20 +1347,20 @@ func (c *Conf) Funcs() map[string]eparse.Func {
 
 	funcs := map[string]eparse.Func{
 		"alert": {
-			Args:   []eparse.FuncType{eparse.TypeString, eparse.TypeString},
-			Return: eparse.TypeNumberSet,
+			Args:   []models.FuncType{models.TypeString, models.TypeString},
+			Return: models.TypeNumberSet,
 			Tags:   tagAlert,
 			F:      c.alert,
 		},
 		"lookup": {
-			Args:   []eparse.FuncType{eparse.TypeString, eparse.TypeString},
-			Return: eparse.TypeNumberSet,
+			Args:   []models.FuncType{models.TypeString, models.TypeString},
+			Return: models.TypeNumberSet,
 			Tags:   lookupTags,
 			F:      lookup,
 		},
 		"lookupSeries": {
-			Args:   []eparse.FuncType{eparse.TypeSeriesSet, eparse.TypeString, eparse.TypeString},
-			Return: eparse.TypeNumberSet,
+			Args:   []models.FuncType{models.TypeSeriesSet, models.TypeString, models.TypeString},
+			Return: models.TypeNumberSet,
 			Tags:   lookupSeriesTags,
 			F:      lookupSeries,
 		},
@@ -1314,6 +1378,9 @@ func (c *Conf) Funcs() map[string]eparse.Func {
 	}
 	if len(c.LogstashElasticHosts) != 0 {
 		merge(expr.LogstashElastic)
+	}
+	if len(c.ElasticHosts) != 0 {
+		merge(expr.Elastic)
 	}
 	if c.InfluxConfig.URL.Host != "" {
 		merge(expr.Influx)

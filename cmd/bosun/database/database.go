@@ -7,16 +7,26 @@ import (
 	"log"
 	"time"
 
-	"bosun.org/_third_party/github.com/garyburd/redigo/redis"
-	"bosun.org/_third_party/github.com/siddontang/ledisdb/config"
-	"bosun.org/_third_party/github.com/siddontang/ledisdb/server"
 	"bosun.org/collect"
 	"bosun.org/metadata"
 	"bosun.org/opentsdb"
+	"github.com/garyburd/redigo/redis"
+	"github.com/siddontang/ledisdb/config"
+	"github.com/siddontang/ledisdb/server"
 )
 
 // Core data access interface for everything sched needs
 type DataAccess interface {
+	Metadata() MetadataDataAccess
+	Configs() ConfigDataAccess
+	Search() SearchDataAccess
+	Errors() ErrorDataAccess
+	State() StateDataAccess
+	Silence() SilenceDataAccess
+	Notifications() NotificationDataAccess
+}
+
+type MetadataDataAccess interface {
 	// Insert Metric Metadata. Field must be one of "desc", "rate", or "unit".
 	PutMetricMetadata(metric string, field string, value string) error
 	// Get Metric Metadata for given metric.
@@ -25,21 +35,26 @@ type DataAccess interface {
 	PutTagMetadata(tags opentsdb.TagSet, name string, value string, updated time.Time) error
 	GetTagMetadata(tags opentsdb.TagSet, name string) ([]*TagMetadata, error)
 	DeleteTagMetadata(tags opentsdb.TagSet, name string) error
+}
 
-	Search_AddMetricForTag(tagK, tagV, metric string, time int64) error
-	Search_GetMetricsForTag(tagK, tagV string) (map[string]int64, error)
+type SearchDataAccess interface {
+	AddMetricForTag(tagK, tagV, metric string, time int64) error
+	GetMetricsForTag(tagK, tagV string) (map[string]int64, error)
 
-	Search_AddTagKeyForMetric(metric, tagK string, time int64) error
-	Search_GetTagKeysForMetric(metric string) (map[string]int64, error)
+	AddTagKeyForMetric(metric, tagK string, time int64) error
+	GetTagKeysForMetric(metric string) (map[string]int64, error)
 
-	Search_AddMetric(metric string, time int64) error
-	Search_GetAllMetrics() (map[string]int64, error)
+	AddMetric(metric string, time int64) error
+	GetAllMetrics() (map[string]int64, error)
 
-	Search_AddTagValue(metric, tagK, tagV string, time int64) error
-	Search_GetTagValues(metric, tagK string) (map[string]int64, error)
+	AddTagValue(metric, tagK, tagV string, time int64) error
+	GetTagValues(metric, tagK string) (map[string]int64, error)
 
-	Search_AddMetricTagSet(metric, tagSet string, time int64) error
-	Search_GetMetricTagSets(metric string, tags opentsdb.TagSet) (map[string]int64, error)
+	AddMetricTagSet(metric, tagSet string, time int64) error
+	GetMetricTagSets(metric string, tags opentsdb.TagSet) (map[string]int64, error)
+
+	BackupLastInfos(map[string]map[string]*LastInfo) error
+	LoadLastInfos() (map[string]map[string]*LastInfo, error)
 }
 
 type dataAccess struct {
@@ -48,13 +63,13 @@ type dataAccess struct {
 }
 
 // Create a new data access object pointed at the specified address. isRedis parameter used to distinguish true redis from ledis in-proc.
-func NewDataAccess(addr string, isRedis bool) DataAccess {
-	return newDataAccess(addr, isRedis)
+func NewDataAccess(addr string, isRedis bool, redisDb int, redisPass string) DataAccess {
+	return newDataAccess(addr, isRedis, redisDb, redisPass)
 }
 
-func newDataAccess(addr string, isRedis bool) *dataAccess {
+func newDataAccess(addr string, isRedis bool, redisDb int, redisPass string) *dataAccess {
 	return &dataAccess{
-		pool:    newPool(addr, "", 0, isRedis, 1000, true),
+		pool:    newPool(addr, redisPass, redisDb, isRedis, 1000, true),
 		isRedis: isRedis,
 	}
 }
@@ -114,4 +129,34 @@ func newPool(server, password string, database int, isRedis bool, maxActive int,
 
 func init() {
 	collect.AggregateMeta("bosun.redis", metadata.MilliSecond, "time in milliseconds per redis call.")
+}
+
+// Ledis can't do DEL in a blanket way like redis can. It has a unique command per type.
+// These helpers allow easy switching.
+func (d *dataAccess) LCLEAR() string {
+	if d.isRedis {
+		return "DEL"
+	}
+	return "LCLEAR"
+}
+
+func (d *dataAccess) SCLEAR() string {
+	if d.isRedis {
+		return "DEL"
+	}
+	return "SCLEAR"
+}
+
+func (d *dataAccess) LMCLEAR(key string, value string) (string, []interface{}) {
+	if d.isRedis {
+		return "LREM", []interface{}{key, 0, value}
+	}
+	return "LMCLEAR", []interface{}{key, value}
+}
+
+func (d *dataAccess) HSCAN() string {
+	if d.isRedis {
+		return "HSCAN"
+	}
+	return "XHSCAN"
 }

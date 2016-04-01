@@ -23,15 +23,28 @@ type Conf struct {
 	Freq int
 	// BatchSize is the number of metrics that will be sent in each batch.
 	BatchSize int
+	// MaxQueueLen is the number of metrics keept internally.
+	MaxQueueLen int
+	// MaxMem is the maximum number of megabytes that can be allocated
+	// before scollector panics (shuts down). Default of 500 MB. This
+	// is a saftey mechanism to protect the host from the monitoring
+	// agent
+	MaxMem uint64
 	// Filter filters collectors matching these terms.
 	Filter []string
 	// PProf is an IP:Port binding to be used for debugging with pprof package.
 	// Examples: localhost:6060 for loopback or :6060 for all IP addresses.
 	PProf string
+	// MetricFilters takes regular expressions and includes only indicies that
+	// match those filters from being monitored
+	MetricFilters []string
 
 	// KeepalivedCommunity, if not empty, enables the Keepalived collector with
 	// the specified community.
 	KeepalivedCommunity string
+
+	//Override default network interface expression
+	IfaceExpr string
 
 	HAProxy        []HAProxy
 	SNMP           []SNMP
@@ -50,6 +63,15 @@ type Conf struct {
 	// namespace
 	ElasticIndexFilters []string
 	RabbitMQ            []RabbitMQ
+	Nexpose             []Nexpose
+	GoogleAnalytics     []GoogleAnalytics
+	Cadvisor            []Cadvisor
+	RedisCounters       []RedisCounters
+	ExtraHop            []ExtraHop
+	LocalListener       string
+	TagOverride         []TagOverride
+	HadoopHost          string
+	Oracles             []Oracle
 }
 
 type HAProxy struct {
@@ -61,6 +83,27 @@ type HAProxy struct {
 type HAProxyInstance struct {
 	Tier string
 	URL  string
+}
+
+type Nexpose struct {
+	Username string
+	Password string
+	Host     string
+	Insecure bool
+}
+
+type GoogleAnalytics struct {
+	ClientID string
+	Secret   string
+	Token    string
+	Sites    []GoogleAnalyticsSite
+}
+
+type GoogleAnalyticsSite struct {
+	Name     string
+	Profile  string
+	Offset   int
+	Detailed bool
 }
 
 type ICMP struct {
@@ -120,6 +163,7 @@ type ProcessDotNet struct {
 type HTTPUnit struct {
 	TOML  string
 	Hiera string
+	Freq  string
 }
 
 type Riak struct {
@@ -133,4 +177,36 @@ type RabbitMQ struct {
 type Github struct {
 	Repo  string
 	Token string
+}
+
+type Cadvisor struct {
+	URL string
+}
+
+type RedisCounters struct {
+	Server   string
+	Database int
+}
+
+type ExtraHop struct {
+	Host          string
+	APIKey        string
+	FilterBy      string
+	FilterPercent int
+}
+
+type TagOverride struct {
+	CollectorExpr string
+	MatchedTags   map[string]string
+	Tags          map[string]string
+}
+
+type Oracle struct {
+	ClusterName string
+	Instances   []OracleInstance
+}
+
+type OracleInstance struct {
+	ConnectionString string
+	Role             string
 }

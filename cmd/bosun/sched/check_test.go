@@ -10,12 +10,12 @@ import (
 	"time"
 
 	"bosun.org/cmd/bosun/conf"
-	"bosun.org/cmd/bosun/expr"
+	"bosun.org/models"
 	"bosun.org/opentsdb"
 )
 
 func TestCheckFlapping(t *testing.T) {
-
+	defer setup()()
 	c, err := conf.New("", `
 		template t {
 			subject = 1
@@ -35,10 +35,10 @@ func TestCheckFlapping(t *testing.T) {
 		t.Fatal(err)
 	}
 	s, _ := initSched(c)
-	ak := expr.NewAlertKey("a", nil)
+	ak := models.NewAlertKey("a", nil)
 	r := &RunHistory{
-		Events: map[expr.AlertKey]*Event{
-			ak: {Status: StWarning},
+		Events: map[models.AlertKey]*models.Event{
+			ak: {Status: models.StWarning},
 		},
 	}
 	hasNots := func() bool {
@@ -56,41 +56,38 @@ func TestCheckFlapping(t *testing.T) {
 		}
 		return false
 	}
-	s.RunHistory(r)
-	if !hasNots() {
-		t.Fatalf("expected notification: %v", s.pendingNotifications)
+
+	type stateTransition struct {
+		S          models.Status
+		ExpectNots bool
 	}
-	r.Events[ak].Status = StNormal
-	s.RunHistory(r)
-	if hasNots() {
-		t.Fatal("unexpected notification")
+	transitions := []stateTransition{
+		{models.StWarning, true},
+		{models.StNormal, false},
+		{models.StWarning, false},
+		{models.StNormal, false},
+		{models.StCritical, true},
+		{models.StWarning, false},
+		{models.StCritical, false},
 	}
-	r.Events[ak].Status = StWarning
-	s.RunHistory(r)
-	if hasNots() {
-		t.Fatal("unexpected notification")
+
+	for i, trans := range transitions {
+		r.Events[ak].Status = trans.S
+		s.RunHistory(r)
+		has := hasNots()
+		if has && !trans.ExpectNots {
+			t.Fatalf("unexpected notifications for transition %d.", i)
+		} else if !has && trans.ExpectNots {
+			t.Fatalf("expected notifications for transition %d.", i)
+		}
 	}
-	r.Events[ak].Status = StNormal
-	s.RunHistory(r)
-	if hasNots() {
-		t.Fatal("unexpected notification")
-	}
-	r.Events[ak].Status = StCritical
-	s.RunHistory(r)
-	if !hasNots() {
-		t.Fatal("expected notification")
-	}
-	r.Events[ak].Status = StNormal
-	s.RunHistory(r)
-	if hasNots() {
-		t.Fatal("unexpected notification")
-	}
+	r.Events[ak].Status = models.StNormal
 	s.RunHistory(r)
 	// Close the alert, so it should notify next time.
-	if err := s.Action("", "", ActionClose, ak); err != nil {
+	if err := s.Action("", "", models.ActionClose, ak); err != nil {
 		t.Fatal(err)
 	}
-	r.Events[ak].Status = StWarning
+	r.Events[ak].Status = models.StWarning
 	s.RunHistory(r)
 	if !hasNots() {
 		t.Fatal("expected notification")
@@ -98,7 +95,7 @@ func TestCheckFlapping(t *testing.T) {
 }
 
 func TestCheckSilence(t *testing.T) {
-
+	defer setup()()
 	done := make(chan bool, 1)
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		done <- true
@@ -129,11 +126,11 @@ func TestCheckSilence(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	_, err = s.AddSilence(time.Now().Add(-time.Hour), time.Now().Add(time.Hour), "a", "", false, true, "", "user", "message")
+	_, err = s.AddSilence(utcNow().Add(-time.Hour), utcNow().Add(time.Hour), "a", "", false, true, "", "user", "message")
 	if err != nil {
 		t.Fatal(err)
 	}
-	check(s, time.Now())
+	check(s, utcNow())
 	s.CheckNotifications()
 	select {
 	case <-done:
@@ -144,6 +141,7 @@ func TestCheckSilence(t *testing.T) {
 }
 
 func TestIncidentIds(t *testing.T) {
+	defer setup()()
 	c, err := conf.New("", `
 		alert a {
 			crit = 1
@@ -153,44 +151,45 @@ func TestIncidentIds(t *testing.T) {
 		t.Fatal(err)
 	}
 	s, _ := initSched(c)
-	ak := expr.NewAlertKey("a", nil)
+	ak := models.NewAlertKey("a", nil)
 	r := &RunHistory{
-		Events: map[expr.AlertKey]*Event{
-			ak: {Status: StWarning},
+		Events: map[models.AlertKey]*models.Event{
+			ak: {Status: models.StWarning},
 		},
 	}
-	expect := func(id uint64) {
-		if s.status[ak].Last().IncidentId != id {
-			t.Fatalf("Expeted incident id %d. Got %d.", id, s.status[ak].Last().IncidentId)
+	expect := func(id int64) {
+		incident, err := s.DataAccess.State().GetLatestIncident(ak)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if incident.Id != id {
+			t.Fatalf("Expeted incident id %d. Got %d.", id, incident.Id)
 		}
 	}
 	s.RunHistory(r)
 	expect(1)
 
-	r.Events[ak].Status = StNormal
-	r.Events[ak].IncidentId = 0
+	r.Events[ak].Status = models.StNormal
 	s.RunHistory(r)
 	expect(1)
 
-	r.Events[ak].Status = StWarning
-	r.Events[ak].IncidentId = 0
+	r.Events[ak].Status = models.StWarning
 	s.RunHistory(r)
 	expect(1)
 
-	r.Events[ak].Status = StNormal
-	r.Events[ak].IncidentId = 0
+	r.Events[ak].Status = models.StNormal
 	s.RunHistory(r)
-	err = s.Action("", "", ActionClose, ak)
+	err = s.Action("", "", models.ActionClose, ak)
 	if err != nil {
 		t.Fatal(err)
 	}
-	r.Events[ak].Status = StWarning
-	r.Events[ak].IncidentId = 0
+	r.Events[ak].Status = models.StWarning
 	s.RunHistory(r)
 	expect(2)
 }
 
 func TestCheckNotify(t *testing.T) {
+	defer setup()()
 	nc := make(chan string)
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		b, _ := ioutil.ReadAll(r.Body)
@@ -221,7 +220,7 @@ func TestCheckNotify(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	check(s, time.Now())
+	check(s, utcNow())
 	s.CheckNotifications()
 	select {
 	case r := <-nc:
@@ -234,6 +233,7 @@ func TestCheckNotify(t *testing.T) {
 }
 
 func TestCheckNotifyUnknown(t *testing.T) {
+	defer setup()()
 	nc := make(chan string, 1)
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		b, _ := ioutil.ReadAll(r.Body)
@@ -245,6 +245,7 @@ func TestCheckNotifyUnknown(t *testing.T) {
 		t.Fatal(err)
 	}
 	c, err := conf.New("", fmt.Sprintf(`
+		minGroupSize = 2
 		template t {
 			subject = {{.Name}}: {{.Group | len}} unknown alerts
 		}
@@ -266,9 +267,9 @@ func TestCheckNotifyUnknown(t *testing.T) {
 		t.Fatal(err)
 	}
 	r := &RunHistory{
-		Events: map[expr.AlertKey]*Event{
-			expr.NewAlertKey("a", opentsdb.TagSet{"h": "x"}): {Status: StUnknown},
-			expr.NewAlertKey("a", opentsdb.TagSet{"h": "y"}): {Status: StUnknown},
+		Events: map[models.AlertKey]*models.Event{
+			models.NewAlertKey("a", opentsdb.TagSet{"h": "x"}): {Status: models.StUnknown},
+			models.NewAlertKey("a", opentsdb.TagSet{"h": "y"}): {Status: models.StUnknown},
 		},
 	}
 	s.RunHistory(r)
@@ -296,6 +297,7 @@ Loop:
 
 // TestCheckNotifyUnknownDefault tests the default unknownTemplate.
 func TestCheckNotifyUnknownDefault(t *testing.T) {
+	defer setup()()
 	nc := make(chan string, 1)
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		b, _ := ioutil.ReadAll(r.Body)
@@ -307,6 +309,7 @@ func TestCheckNotifyUnknownDefault(t *testing.T) {
 		t.Fatal(err)
 	}
 	c, err := conf.New("", fmt.Sprintf(`
+		minGroupSize = 2
 		template t {
 			subject = template
 		}
@@ -327,9 +330,9 @@ func TestCheckNotifyUnknownDefault(t *testing.T) {
 		t.Fatal(err)
 	}
 	r := &RunHistory{
-		Events: map[expr.AlertKey]*Event{
-			expr.NewAlertKey("a", opentsdb.TagSet{"h": "x"}): {Status: StUnknown},
-			expr.NewAlertKey("a", opentsdb.TagSet{"h": "y"}): {Status: StUnknown},
+		Events: map[models.AlertKey]*models.Event{
+			models.NewAlertKey("a", opentsdb.TagSet{"h": "x"}): {Status: models.StUnknown},
+			models.NewAlertKey("a", opentsdb.TagSet{"h": "y"}): {Status: models.StUnknown},
 		},
 	}
 	s.RunHistory(r)
@@ -356,6 +359,7 @@ Loop:
 }
 
 func TestCheckNotifyLog(t *testing.T) {
+	defer setup()()
 	nc := make(chan string, 1)
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		b, _ := ioutil.ReadAll(r.Body)
@@ -392,7 +396,7 @@ func TestCheckNotifyLog(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	check(s, time.Now())
+	check(s, utcNow())
 	s.CheckNotifications()
 	gotA := false
 	gotB := false
@@ -418,8 +422,12 @@ Loop:
 	if !gotB {
 		t.Errorf("didn't get expected b")
 	}
-	for ak, st := range s.status {
-		switch ak {
+	status, err := s.DataAccess.State().GetAllOpenIncidents()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, st := range status {
+		switch st.AlertKey {
 		case "a{}":
 			if !st.Open {
 				t.Errorf("expected a to be open")
@@ -429,56 +437,7 @@ Loop:
 				t.Errorf("expected b to be closed")
 			}
 		default:
-			t.Errorf("unexpected alert key %s", ak)
+			t.Errorf("unexpected alert key %s", st.AlertKey)
 		}
 	}
-}
-
-// TestCheckCritUnknownEmpty checks that if an alert goes normal -> crit ->
-// unknown, it's body and subject are empty. This is because we should not
-// keep around the crit template renders if we are unknown.
-func TestCheckCritUnknownEmpty(t *testing.T) {
-	c, err := conf.New("", `
-		template t {
-			subject = 1
-			body = 2
-		}
-		alert a {
-			crit = 1
-			template = t
-		}
-	`)
-	if err != nil {
-		t.Fatal(err)
-	}
-	s, _ := initSched(c)
-	ak := expr.NewAlertKey("a", nil)
-	r := &RunHistory{
-		Events: map[expr.AlertKey]*Event{
-			ak: {Status: StNormal},
-		},
-	}
-	verify := func(empty bool) {
-		st := s.GetStatus(ak)
-		if empty {
-			if st.Body != "" || st.Subject != "" {
-				t.Fatalf("expected empty body and subject")
-			}
-		} else {
-			if st.Body != "<html><head></head><body>2</body></html>" || st.Subject != "1" {
-				t.Fatalf("expected body and subject")
-			}
-		}
-	}
-	s.RunHistory(r)
-	verify(true)
-	r.Events[ak].Status = StCritical
-	s.RunHistory(r)
-	verify(false)
-	r.Events[ak].Status = StUnknown
-	s.RunHistory(r)
-	verify(true)
-	r.Events[ak].Status = StNormal
-	s.RunHistory(r)
-	verify(true)
 }
