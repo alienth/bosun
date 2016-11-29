@@ -4,7 +4,9 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"strconv"
 	"strings"
+	"time"
 
 	"bosun.org/opentsdb"
 	"github.com/urfave/cli"
@@ -19,6 +21,8 @@ import (
 // 0, delete that day.
 
 var debug = false
+
+var host string
 
 func main() {
 	app := cli.NewApp()
@@ -48,6 +52,11 @@ func main() {
 		},
 	}
 
+	app.Before = func(c *cli.Context) error {
+		host = c.GlobalString("host")
+		return nil
+	}
+
 	app.Action = Run
 
 	err := app.Run(os.Args)
@@ -58,26 +67,32 @@ func main() {
 
 func Run(c *cli.Context) error {
 
-	metrics, err := listMetrics()
-	if err != nil {
-		return err
-	}
+	//metrics, err := listMetrics()
+	//if err != nil {
+	//	return err
+	//}
+
+	metrics := make([]metric, 1)
+	metrics[0] = metric{name: "linux.mem.active"}
 
 	for _, m := range metrics {
-		era := findMetricEra(m)
-		if era == 0 {
-			fmt.Printf("Metric %s has no datapoints!\n", m)
+		err := m.gatherInfo()
+		if err != nil {
+			fmt.Println(err)
 		}
-		if era > 30 {
-			fmt.Printf("Metric %s has no datapoints since %d days ago!\n", m, era)
+
+		for t, d := range m.datapointsPerDay {
+			fmt.Println(t.Unix(), d)
+
 		}
 
 	}
+
 	return nil
 }
 
 // Returns a list of all metrics.
-func listMetrics() ([]string, error) {
+func listMetrics() ([]metric, error) {
 
 	cmd := exec.Command("tsdb", "uid", "grep", "metrics", ".")
 
@@ -90,13 +105,15 @@ func listMetrics() ([]string, error) {
 		return nil, err
 	}
 
-	results := make([]string, 0)
+	results := make([]metric, 0)
 	for _, line := range strings.Split(string(out), "\n") {
 		if !strings.HasPrefix(line, "metrics ") {
 			continue
 		}
 		fields := strings.Split(line, ":")
-		results = append(results, strings.Split(fields[0], " ")[1])
+		name := strings.Split(fields[0], " ")[1]
+		m := metric{name: name}
+		results = append(results, m)
 	}
 
 	return results, nil
@@ -105,28 +122,87 @@ func listMetrics() ([]string, error) {
 // Returns when this metric was most recently used?
 // Short-circuit if the metric is active today.
 // If not active today, go back one breadth of time at a time to find when it was last active.
-func findMetricEra(metric string) int {
+func (m *metric) gatherInfo() error {
+	if m.tagKeys == nil {
+		m.tagKeys = make(map[string]bool)
+	}
+	if m.datapointsPerDay == nil {
+		m.datapointsPerDay = make(map[time.Time]int64)
+	}
 
 	var query opentsdb.Query
 
-	query.Metric = metric
+	query.Metric = m.name
 	query.Downsample = "1d-count"
 	query.Aggregator = "sum"
 
-	for days := 1; days < 3650; days++ {
+	for days := 1; days < 10; days++ {
 		var request opentsdb.Request
 		request.Start = fmt.Sprintf("%dd-ago", days)
-		request.Queries = []*opentsdb.Query{&query}
-
-		resp, err := request.Query("ny-tsdb01:4242")
-		if err != nil {
-			fmt.Println(err)
-			return 0
+		request.End = fmt.Sprintf("%dd-ago", days-1)
+		if request.End == "0d-ago" {
+			request.End = "1s-ago"
 		}
-		if len(resp) > 0 {
-			return days
+		request.Queries = []*opentsdb.Query{&query}
+		fmt.Println(request)
+
+		resp, err := request.Query(host)
+		if err != nil {
+			return err
+		}
+		for _, r := range resp {
+			for ts, d := range r.DPS {
+				tn, err := strconv.ParseInt(ts, 10, 64)
+				if err != nil {
+					return err
+				}
+				t := time.Unix(tn, 0)
+				if t.After(m.last) {
+					m.last = t
+				}
+				if m.first.IsZero() || t.Before(m.first) {
+					m.first = t
+				}
+
+				// Since we're aggregating by 1d, this should
+				// always effectively be a noop.
+				t = t.Truncate(time.Hour * 24)
+
+				m.datapointsPerDay[t] += int64(d)
+			}
+
+			for _, k := range r.AggregateTags {
+				if !m.tagKeys[k] {
+					m.tagKeys[k] = true
+				}
+				//	newQuery := query
+				//	newQuery.Tags = opentsdb.TagSet{k: "*"}
+				//	newResp, err := request.Query(host)
+				//	if err != nil {
+				//		return err
+				//	}
+				//	for _, n := range newResp {
+				//		fmt.Println(n.Tags)
+				//	}
+
+			}
 		}
 	}
 
-	return 0
+	return nil
+}
+
+type metric struct {
+	name             string
+	first            time.Time
+	last             time.Time
+	tagKeys          map[string]bool
+	tags             []opentsdb.TagSet
+	datapointsPerDay map[time.Time]int64
+}
+
+// Deletes rows containing nothing but 0 values.
+func deleteZeroValues(m metric) error {
+
+	return nil
 }
