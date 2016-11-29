@@ -82,13 +82,14 @@ func Run(c *cli.Context) error {
 			return err
 		}
 
-		for t, d := range m.datapointsPerDay {
-			fmt.Println(t.Unix(), d)
+		//for t, d := range m.datapointsPerDay {
 
-		}
+		//}
 
 		for _, tag := range m.tagSets {
-			fmt.Println(tag.set, tag.last, tag.first)
+			if time.Now().Sub(tag.last) > time.Hour*24*30 {
+				fmt.Printf("Tagset %s is very old\n.", tag.set.String())
+			}
 		}
 
 	}
@@ -124,9 +125,6 @@ func listMetrics() ([]metric, error) {
 	return results, nil
 }
 
-// Returns when this metric was most recently used?
-// Short-circuit if the metric is active today.
-// If not active today, go back one breadth of time at a time to find when it was last active.
 func (m *metric) gatherInfo() error {
 	if m.tagKeys == nil {
 		m.tagKeys = make(map[string]bool)
@@ -152,7 +150,6 @@ func (m *metric) gatherInfo() error {
 			request.End = "1s-ago"
 		}
 		request.Queries = []*opentsdb.Query{&query}
-		fmt.Println(request)
 
 		resp, err := request.Query(host)
 		if err != nil {
@@ -203,13 +200,11 @@ func (m *metric) gatherInfo() error {
 		}
 		count += m.datapointsPerDay[t]
 		if count > 10000000 {
-			fmt.Printf("Gathering tags on %d datapoints\n", count)
 			m.gatherTagSets(start, t)
 			count = 0
 		}
 	}
 	if count != 0 {
-		fmt.Printf("Gathering tags on %d datapoints\n", count)
 		if err := m.gatherTagSets(start, time.Now()); err != nil {
 			return err
 		}
@@ -235,7 +230,6 @@ func (m *metric) gatherTagSets(start, end time.Time) error {
 	request.Start = start.Unix()
 	request.End = end.Unix()
 	request.Queries = []*opentsdb.Query{&query}
-	fmt.Println(request)
 
 	resp, err := request.Query(host)
 	if err != nil {
