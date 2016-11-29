@@ -79,7 +79,7 @@ func Run(c *cli.Context) error {
 	for _, m := range metrics {
 		err := m.gatherInfo()
 		if err != nil {
-			return error
+			return err
 		}
 
 		for t, d := range m.datapointsPerDay {
