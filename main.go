@@ -2,14 +2,17 @@ package main
 
 import (
 	"fmt"
+	"io/ioutil"
 	"os"
 	"os/exec"
+	"regexp"
 	"sort"
 	"strconv"
 	"strings"
 	"time"
 
 	"bosun.org/opentsdb"
+	"github.com/BurntSushi/toml"
 	"github.com/urfave/cli"
 )
 
@@ -66,6 +69,22 @@ func main() {
 	}
 }
 
+var rules []rule
+
+func loadRules(c *cli.Context) error {
+
+	body, err := ioutil.ReadFile(c.String("config"))
+	if err != nil {
+		return err
+	}
+
+	if err := toml.Unmarshal(body, &rules); err != nil {
+		return err
+	}
+
+	return nil
+}
+
 func Run(c *cli.Context) error {
 
 	//metrics, err := listMetrics()
@@ -73,26 +92,66 @@ func Run(c *cli.Context) error {
 	//	return err
 	//}
 
+	loadRules(c)
+
 	metrics := make([]metric, 1)
 	metrics[0] = metric{name: "linux.mem.active"}
 
-	for _, m := range metrics {
-		err := m.gatherInfo()
-		if err != nil {
-			return err
-		}
+	//	for _, m := range metrics {
+	//		err := m.gatherInfo()
+	//		if err != nil {
+	//			return err
+	//		}
 
-		//for t, d := range m.datapointsPerDay {
+	//for t, d := range m.datapointsPerDay {
 
-		//}
+	//}
 
-		for _, tag := range m.tagSets {
-			if time.Now().Sub(tag.last) > time.Hour*24*30 {
-				fmt.Printf("Tagset %s is very old\n.", tag.set.String())
+	//		for _, tag := range m.tagSets {
+	//			if time.Now().Sub(tag.last) > time.Hour*24*30 {
+	//				fmt.Printf("Tagset %s is very old\n.", tag.set.String())
+	//			}
+	//		}
+
+	//	}
+
+	return nil
+}
+
+type rule struct {
+	Metrics  []regexp.Regexp
+	Expire   time.Duration
+	Cooldown time.Duration
+	ZeroOnly bool
+}
+
+func process(metrics []metric, rules []rule) error {
+	for _, r := range rules {
+
+		for _, m := range metrics {
+			found := false
+			for _, reg := range r.Metrics {
+				if reg.Match([]byte(m.name)) {
+					found = true
+					break
+				}
 			}
+			if !found {
+				continue
+			}
+
+			if err := processIt(m, r); err != nil {
+				return err
+			}
+
 		}
 
 	}
+
+	return nil
+}
+
+func processIt(m metric, r rule) error {
 
 	return nil
 }
@@ -125,7 +184,7 @@ func listMetrics() ([]metric, error) {
 	return results, nil
 }
 
-func (m *metric) gatherInfo() error {
+func (m *metric) gatherInfo(start, end time.Time, gatherTags bool) error {
 	if m.tagKeys == nil {
 		m.tagKeys = make(map[string]bool)
 	}
@@ -142,13 +201,10 @@ func (m *metric) gatherInfo() error {
 	query.Downsample = "1d-count"
 	query.Aggregator = "sum"
 
-	for days := 1; days < 365; days++ {
+	for ; start.Before(end); start = start.Add(time.Hour * 24) {
 		var request opentsdb.Request
-		request.Start = fmt.Sprintf("%dd-ago", days)
-		request.End = fmt.Sprintf("%dd-ago", days-1)
-		if request.End == "0d-ago" {
-			request.End = "1s-ago"
-		}
+		request.Start = start.Unix()
+		request.End = start.Add(time.Hour * 24)
 		request.Queries = []*opentsdb.Query{&query}
 
 		resp, err := request.Query(host)
@@ -192,20 +248,20 @@ func (m *metric) gatherInfo() error {
 	}
 	sort.Sort(days)
 
-	var start time.Time
+	var day time.Time
 	for _, t := range days {
-		if start.IsZero() {
-			start = t
+		if day.IsZero() {
+			day = t
 			continue
 		}
 		count += m.datapointsPerDay[t]
 		if count > 10000000 {
-			m.gatherTagSets(start, t)
+			m.gatherTagSets(day, t)
 			count = 0
 		}
 	}
 	if count != 0 {
-		if err := m.gatherTagSets(start, time.Now()); err != nil {
+		if err := m.gatherTagSets(day, time.Now()); err != nil {
 			return err
 		}
 	}
