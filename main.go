@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -129,6 +130,9 @@ func (m *metric) gatherInfo() error {
 	if m.datapointsPerDay == nil {
 		m.datapointsPerDay = make(map[time.Time]int64)
 	}
+	if m.tagSets == nil {
+		m.tagSets = make([]tagSet, 0)
+	}
 
 	var query opentsdb.Query
 
@@ -189,7 +193,68 @@ func (m *metric) gatherInfo() error {
 		}
 	}
 
+	// Where we gather all of the tag values.
+	var count int64
+	days := make(sortableTimes, 0)
+	for t := range m.datapointsPerDay {
+		days = append(days, t)
+	}
+	sort.Sort(days)
+
+	var start time.Time
+	for _, t := range days {
+		if start.IsZero() {
+			start = t
+			continue
+		}
+		count += m.datapointsPerDay[t]
+		if count > 10000000 {
+			fmt.Printf("Gathering tags on %d datapoints\n", count)
+			m.gatherTagSets(start, t)
+			count = 0
+		}
+	}
+	if count != 0 {
+		fmt.Printf("Gathering tags on %d datapoints\n", count)
+		m.gatherTagSets(start, time.Now())
+	}
+
 	return nil
+}
+
+// Takes a start time and an end time, queries for all tags on a metric, and
+// populates the tagSets field.
+func (m *metric) gatherTagSets(start, end time.Time) error {
+	var query opentsdb.Query
+
+	query.Metric = m.name
+	query.Downsample = "1d-count"
+	query.Aggregator = "sum"
+	query.Tags = make(opentsdb.TagSet)
+	for k := range m.tagKeys {
+		query.Tags[k] = "*"
+	}
+
+	var request opentsdb.Request
+	request.Start = start.Unix()
+	request.End = end.Unix()
+	request.Queries = []*opentsdb.Query{&query}
+	fmt.Println(request)
+
+	//		resp, err := request.Query(host)
+	//		if err != nil {
+	//			return err
+	//		}
+
+	return nil
+}
+
+type sortableTimes []time.Time
+
+func (s sortableTimes) Len() int      { return len(s) }
+func (s sortableTimes) Swap(i, j int) { s[i], s[j] = s[j], s[i] }
+func (s sortableTimes) Less(i, j int) bool {
+	return s[i].Before(s[j])
 }
 
 type metric struct {
@@ -197,7 +262,14 @@ type metric struct {
 	first            time.Time
 	last             time.Time
 	tagKeys          map[string]bool
-	tags             []opentsdb.TagSet
+	tagSets          []tagSet
+	datapointsPerDay map[time.Time]int64
+}
+
+type tagSet struct {
+	set              opentsdb.TagSet
+	first            time.Time
+	last             time.Time
 	datapointsPerDay map[time.Time]int64
 }
 
