@@ -6,8 +6,17 @@ import (
 	"os/exec"
 	"strings"
 
+	"bosun.org/opentsdb"
 	"github.com/urfave/cli"
 )
+
+// For each metric, we need to know:
+// What that metrics oldest and newest datapoints are.
+// For each tag k/v of a metric, we need to know:
+// What that the oldest and newest datapoints are for that k/v.
+
+// For each day over our expire limit, get the day's max and min. If both are
+// 0, delete that day.
 
 var debug = false
 
@@ -49,7 +58,21 @@ func main() {
 
 func Run(c *cli.Context) error {
 
-	fmt.Println(listMetrics())
+	metrics, err := listMetrics()
+	if err != nil {
+		return err
+	}
+
+	for _, m := range metrics {
+		era := findMetricEra(m)
+		if era == 0 {
+			fmt.Printf("Metric %s has no datapoints!\n", m)
+		}
+		if era > 30 {
+			fmt.Printf("Metric %s has no datapoints since %d days ago!\n", m, era)
+		}
+
+	}
 	return nil
 }
 
@@ -77,4 +100,33 @@ func listMetrics() ([]string, error) {
 	}
 
 	return results, nil
+}
+
+// Returns when this metric was most recently used?
+// Short-circuit if the metric is active today.
+// If not active today, go back one breadth of time at a time to find when it was last active.
+func findMetricEra(metric string) int {
+
+	var query opentsdb.Query
+
+	query.Metric = metric
+	query.Downsample = "1d-count"
+	query.Aggregator = "sum"
+
+	for days := 1; days < 3650; days++ {
+		var request opentsdb.Request
+		request.Start = fmt.Sprintf("%dd-ago", days)
+		request.Queries = []*opentsdb.Query{&query}
+
+		resp, err := request.Query("ny-tsdb01:4242")
+		if err != nil {
+			fmt.Println(err)
+			return 0
+		}
+		if len(resp) > 0 {
+			return days
+		}
+	}
+
+	return 0
 }
