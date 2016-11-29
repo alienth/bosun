@@ -79,12 +79,16 @@ func Run(c *cli.Context) error {
 	for _, m := range metrics {
 		err := m.gatherInfo()
 		if err != nil {
-			fmt.Println(err)
+			return error
 		}
 
 		for t, d := range m.datapointsPerDay {
 			fmt.Println(t.Unix(), d)
 
+		}
+
+		for _, tag := range m.tagSets {
+			fmt.Println(tag.set, tag.last, tag.first)
 		}
 
 	}
@@ -131,7 +135,7 @@ func (m *metric) gatherInfo() error {
 		m.datapointsPerDay = make(map[time.Time]int64)
 	}
 	if m.tagSets == nil {
-		m.tagSets = make([]tagSet, 0)
+		m.tagSets = make(map[string]*tagSet, 0)
 	}
 
 	var query opentsdb.Query
@@ -140,7 +144,7 @@ func (m *metric) gatherInfo() error {
 	query.Downsample = "1d-count"
 	query.Aggregator = "sum"
 
-	for days := 1; days < 10; days++ {
+	for days := 1; days < 365; days++ {
 		var request opentsdb.Request
 		request.Start = fmt.Sprintf("%dd-ago", days)
 		request.End = fmt.Sprintf("%dd-ago", days-1)
@@ -179,16 +183,6 @@ func (m *metric) gatherInfo() error {
 				if !m.tagKeys[k] {
 					m.tagKeys[k] = true
 				}
-				//	newQuery := query
-				//	newQuery.Tags = opentsdb.TagSet{k: "*"}
-				//	newResp, err := request.Query(host)
-				//	if err != nil {
-				//		return err
-				//	}
-				//	for _, n := range newResp {
-				//		fmt.Println(n.Tags)
-				//	}
-
 			}
 		}
 	}
@@ -216,7 +210,9 @@ func (m *metric) gatherInfo() error {
 	}
 	if count != 0 {
 		fmt.Printf("Gathering tags on %d datapoints\n", count)
-		m.gatherTagSets(start, time.Now())
+		if err := m.gatherTagSets(start, time.Now()); err != nil {
+			return err
+		}
 	}
 
 	return nil
@@ -241,10 +237,41 @@ func (m *metric) gatherTagSets(start, end time.Time) error {
 	request.Queries = []*opentsdb.Query{&query}
 	fmt.Println(request)
 
-	//		resp, err := request.Query(host)
-	//		if err != nil {
-	//			return err
-	//		}
+	resp, err := request.Query(host)
+	if err != nil {
+		return err
+	}
+
+	for _, r := range resp {
+		if tags, ok := m.tagSets[r.Tags.String()]; !ok {
+			tags = &tagSet{}
+			tags.set = r.Tags
+			tags.datapointsPerDay = make(map[time.Time]int64)
+			m.tagSets[r.Tags.String()] = tags
+		}
+		tags := m.tagSets[r.Tags.String()]
+
+		for timeStr, d := range r.DPS {
+			tn, err := strconv.ParseInt(timeStr, 10, 64)
+			if err != nil {
+				return err
+			}
+			t := time.Unix(tn, 0)
+			if t.After(tags.last) {
+				tags.last = t
+			}
+			if tags.first.IsZero() || t.Before(tags.first) {
+				tags.first = t
+			}
+
+			// Since we're aggregating by 1d, this should
+			// always effectively be a noop.
+			t = t.Truncate(time.Hour * 24)
+
+			tags.datapointsPerDay[t] += int64(d)
+		}
+
+	}
 
 	return nil
 }
@@ -262,7 +289,7 @@ type metric struct {
 	first            time.Time
 	last             time.Time
 	tagKeys          map[string]bool
-	tagSets          []tagSet
+	tagSets          map[string]*tagSet
 	datapointsPerDay map[time.Time]int64
 }
 
