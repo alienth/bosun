@@ -5,7 +5,6 @@ import (
 	"io/ioutil"
 	"os"
 	"os/exec"
-	"regexp"
 	"sort"
 	"strconv"
 	"strings"
@@ -13,6 +12,7 @@ import (
 
 	"bosun.org/opentsdb"
 	"github.com/BurntSushi/toml"
+	"github.com/gobwas/glob"
 	"github.com/urfave/cli"
 )
 
@@ -69,7 +69,12 @@ func main() {
 	}
 }
 
-var rules []rule
+type configFile struct {
+	Rule     []rule
+	LookBack string
+}
+
+var config configFile
 
 func loadRules(c *cli.Context) error {
 
@@ -78,8 +83,19 @@ func loadRules(c *cli.Context) error {
 		return err
 	}
 
-	if err := toml.Unmarshal(body, &rules); err != nil {
+	if err := toml.Unmarshal(body, &config); err != nil {
 		return err
+	}
+
+	for _, r := range config.Rule {
+		for _, m := range r.Metrics {
+			g, err := glob.Compile(m)
+			if err != nil {
+				return err
+			}
+			r.Globs = append(r.Globs, g)
+		}
+
 	}
 
 	return nil
@@ -92,10 +108,15 @@ func Run(c *cli.Context) error {
 	//	return err
 	//}
 
-	loadRules(c)
+	if err := loadRules(c); err != nil {
+		return err
+	}
+
+	fmt.Println(config)
 
 	metrics := make([]metric, 1)
 	metrics[0] = metric{name: "linux.mem.active"}
+	metrics[1] = metric{name: "linux.interrupts"}
 
 	//	for _, m := range metrics {
 	//		err := m.gatherInfo()
@@ -119,9 +140,10 @@ func Run(c *cli.Context) error {
 }
 
 type rule struct {
-	Metrics  []regexp.Regexp
-	Expire   time.Duration
-	Cooldown time.Duration
+	Metrics  []string
+	Globs    []glob.Glob
+	Expire   opentsdb.Duration
+	Cooldown opentsdb.Duration
 	ZeroOnly bool
 }
 
@@ -131,10 +153,11 @@ func process(metrics []metric, rules []rule) error {
 		for _, m := range metrics {
 			found := false
 			for _, reg := range r.Metrics {
-				if reg.Match([]byte(m.name)) {
-					found = true
-					break
-				}
+				_ = reg
+				//				if reg.Match([]byte(m.name)) {
+				//					found = true
+				//					break
+				//				}
 			}
 			if !found {
 				continue
