@@ -207,7 +207,7 @@ func processIt(m metric, r *rule) error {
 		fmt.Println(t)
 	}
 
-	if days[len(days)].Before(expire) {
+	if days[len(days)-1].Before(expire) {
 		fmt.Printf("Deleting datapoints for metric %s. Start: %s, End: %s\n", m.name, start, end)
 		m.delete(start, expire)
 	}
