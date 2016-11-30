@@ -27,8 +27,10 @@ import (
 var debug = false
 
 var host string
+var now time.Time
 
 func main() {
+	now = time.Now()
 	app := cli.NewApp()
 	app.Name = "tsdb-expire"
 
@@ -70,14 +72,13 @@ func main() {
 }
 
 type configFile struct {
-	Rule     []rule
-	LookBack string
+	Rule     []*rule
+	LookBack opentsdb.Duration
 }
 
 var config configFile
 
 func loadRules(c *cli.Context) error {
-
 	body, err := ioutil.ReadFile(c.String("config"))
 	if err != nil {
 		return err
@@ -95,7 +96,6 @@ func loadRules(c *cli.Context) error {
 			}
 			r.Globs = append(r.Globs, g)
 		}
-
 	}
 
 	return nil
@@ -112,11 +112,14 @@ func Run(c *cli.Context) error {
 		return err
 	}
 
-	fmt.Println(config)
-
-	metrics := make([]metric, 1)
+	metrics := make([]metric, 2)
 	metrics[0] = metric{name: "linux.mem.active"}
 	metrics[1] = metric{name: "linux.interrupts"}
+
+	err := process(metrics)
+	if err != nil {
+		return err
+	}
 
 	//	for _, m := range metrics {
 	//		err := m.gatherInfo()
@@ -147,17 +150,16 @@ type rule struct {
 	ZeroOnly bool
 }
 
-func process(metrics []metric, rules []rule) error {
-	for _, r := range rules {
+func process(metrics []metric) error {
+	for _, r := range config.Rule {
 
 		for _, m := range metrics {
 			found := false
-			for _, reg := range r.Metrics {
-				_ = reg
-				//				if reg.Match([]byte(m.name)) {
-				//					found = true
-				//					break
-				//				}
+			for _, g := range r.Globs {
+				if g.Match(m.name) {
+					found = true
+					break
+				}
 			}
 			if !found {
 				continue
@@ -174,9 +176,49 @@ func process(metrics []metric, rules []rule) error {
 	return nil
 }
 
-func processIt(m metric, r rule) error {
+func processIt(m metric, r *rule) error {
+
+	lookBack := now.Add(time.Duration(config.LookBack) * -1).Truncate(time.Hour * 24)
+	expire := now.Add(time.Duration(r.Expire) * -1).Truncate(time.Hour * 24)
+
+	start := lookBack
+	end := expire
+	var cooldown time.Time
+	dataWithinCooldown := false
+	if r.Cooldown.Seconds() != 0 {
+		cooldown = now.Add(time.Duration(r.Cooldown) * -1).Truncate(time.Hour * 24)
+		end = cooldown
+	}
+
+	m.gatherInfo(start, end, false)
+
+	days := m.sortedDays(true)
+	if days[0].After(cooldown) {
+		dataWithinCooldown = true
+	}
+	for _, t := range days {
+		fmt.Println(t)
+	}
+
+	fmt.Println(dataWithinCooldown)
 
 	return nil
+}
+
+// sortedDays returns a sorted list of time.Times representing days that this
+// metric has datapoints.
+func (m metric) sortedDays(reverse bool) []time.Time {
+	days := make(sortableTimes, 0)
+	for t := range m.datapointsPerDay {
+		days = append(days, t)
+	}
+	if !reverse {
+		sort.Sort(days)
+	} else {
+		sort.Sort(sort.Reverse(days))
+	}
+
+	return []time.Time(days)
 }
 
 // Returns a list of all metrics.
@@ -224,12 +266,16 @@ func (m *metric) gatherInfo(start, end time.Time, gatherTags bool) error {
 	query.Downsample = "1d-count"
 	query.Aggregator = "sum"
 
+	breadth := time.Hour * 24
 	for ; start.Before(end); start = start.Add(time.Hour * 24) {
 		var request opentsdb.Request
 		request.Start = start.Unix()
-		request.End = start.Add(time.Hour * 24)
+		request.End = start.Add(breadth).Unix()
 		request.Queries = []*opentsdb.Query{&query}
 
+		if debug {
+			fmt.Println(request)
+		}
 		resp, err := request.Query(host)
 		if err != nil {
 			return err
@@ -263,29 +309,26 @@ func (m *metric) gatherInfo(start, end time.Time, gatherTags bool) error {
 		}
 	}
 
-	// Where we gather all of the tag values.
-	var count int64
-	days := make(sortableTimes, 0)
-	for t := range m.datapointsPerDay {
-		days = append(days, t)
-	}
-	sort.Sort(days)
+	if gatherTags {
+		// Where we gather all of the tag values.
+		var count int64
 
-	var day time.Time
-	for _, t := range days {
-		if day.IsZero() {
-			day = t
-			continue
+		var day time.Time
+		for _, t := range m.sortedDays(false) {
+			if day.IsZero() {
+				day = t
+				continue
+			}
+			count += m.datapointsPerDay[t]
+			if count > 10000000 {
+				m.gatherTagSets(day, t)
+				count = 0
+			}
 		}
-		count += m.datapointsPerDay[t]
-		if count > 10000000 {
-			m.gatherTagSets(day, t)
-			count = 0
-		}
-	}
-	if count != 0 {
-		if err := m.gatherTagSets(day, time.Now()); err != nil {
-			return err
+		if count != 0 {
+			if err := m.gatherTagSets(day, time.Now()); err != nil {
+				return err
+			}
 		}
 	}
 
