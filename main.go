@@ -187,22 +187,60 @@ func processIt(m metric, r *rule) error {
 	dataWithinCooldown := false
 	if r.Cooldown.Seconds() != 0 {
 		cooldown = now.Add(time.Duration(r.Cooldown) * -1).Truncate(time.Hour * 24)
-		end = cooldown
+		if cooldown.After(end) {
+			end = cooldown
+		}
 	}
 
 	m.gatherInfo(start, end, false)
 
 	days := m.sortedDays(true)
+	fmt.Printf("cooldown: %s\n", cooldown)
 	if days[0].After(cooldown) {
 		dataWithinCooldown = true
 	}
+	if !cooldown.IsZero() && dataWithinCooldown {
+		fmt.Printf("%s has data within cooldown. Ignoring\n", m.name)
+	}
+
 	for _, t := range days {
 		fmt.Println(t)
 	}
 
-	fmt.Println(dataWithinCooldown)
+	if days[len(days)].Before(expire) {
+		fmt.Printf("Deleting datapoints for metric %s. Start: %s, End: %s\n", m.name, start, end)
+		m.delete(start, expire)
+	}
 
 	return nil
+}
+
+func (m metric) delete(start, end time.Time) error {
+	var query opentsdb.Query
+
+	query.Metric = m.name
+	query.Downsample = "1d-count"
+	query.Aggregator = "sum"
+
+	breadth := time.Hour * 24
+	for ; start.Before(end); start = start.Add(time.Hour * 24) {
+		var request opentsdb.Request
+		request.Start = start.Unix()
+		request.End = start.Add(breadth).Unix()
+		request.Queries = []*opentsdb.Query{&query}
+		// request.Delete = true
+
+		if debug {
+			fmt.Println(request)
+		}
+		_, err := request.Query(host)
+		if err != nil {
+			return err
+		}
+	}
+
+	return nil
+
 }
 
 // sortedDays returns a sorted list of time.Times representing days that this
