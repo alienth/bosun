@@ -62,6 +62,7 @@ func main() {
 
 	app.Before = func(c *cli.Context) error {
 		host = c.GlobalString("host")
+		debug = c.GlobalBool("debug")
 		return nil
 	}
 
@@ -105,18 +106,18 @@ func loadRules(c *cli.Context) error {
 
 func Run(c *cli.Context) error {
 
-	//metrics, err := listMetrics()
-	//if err != nil {
-	//	return err
-	//}
+	metrics, err := listMetrics()
+	if err != nil {
+		return err
+	}
 
 	if err := loadRules(c); err != nil {
 		return err
 	}
 
-	metrics := make([]metric, 2)
-	metrics[0] = metric{name: "linux.mem.active"}
-	metrics[1] = metric{name: "linux.interrupts"}
+	// metrics := make([]metric, 2)
+	// metrics[0] = metric{name: "linux.mem.active"}
+	// metrics[1] = metric{name: "linux.interrupts"}
 
 	for _, r := range config.Rule {
 
@@ -170,16 +171,11 @@ func process(m metric, r *rule) error {
 	m.gatherInfo(start, end, false)
 
 	days := m.sortedDays(true)
-	fmt.Printf("cooldown: %s\n", cooldown)
 	if days[0].After(cooldown) {
 		dataWithinCooldown = true
 	}
 	if !cooldown.IsZero() && dataWithinCooldown {
 		fmt.Printf("%s has data within cooldown. Ignoring\n", m.name)
-	}
-
-	for _, t := range days {
-		fmt.Println(t)
 	}
 
 	if days[len(days)-1].Before(expire) {
@@ -222,16 +218,16 @@ func (m metric) delete(start, end time.Time) error {
 }
 
 func (m metric) deleteZeroOnly(start, end time.Time) error {
-	queries := make([]*opentsdb.Query, 2)
+	// queries := make([]*opentsdb.Query, 2)
+	queries := []*opentsdb.Query{&opentsdb.Query{}, &opentsdb.Query{}}
 	queries[0].Metric = m.name
 	queries[0].Downsample = "1d-max"
 	queries[0].Aggregator = "sum"
-	queries[0].Metric = m.name
-	queries[0].Downsample = "1d-min"
-	queries[0].Aggregator = "sum"
+	queries[1].Metric = m.name
+	queries[1].Downsample = "1d-min"
+	queries[1].Aggregator = "sum"
 
-	nonZeroesPresent := false
-	for start := start; start.Before(end); start = start.Add(time.Hour * 24) {
+	for ; start.Before(end); start = start.Add(time.Hour * 24) {
 		var request opentsdb.Request
 		request.Start = start.Unix()
 		request.End = start.Add(breadth).Unix()
@@ -245,6 +241,7 @@ func (m metric) deleteZeroOnly(start, end time.Time) error {
 			return err
 		}
 
+		nonZeroesPresent := false
 		for _, r := range resp {
 			for _, d := range r.DPS {
 				if d != 0 {
@@ -253,14 +250,13 @@ func (m metric) deleteZeroOnly(start, end time.Time) error {
 				}
 			}
 		}
-
-	}
-	if !nonZeroesPresent {
-		if err := m.delete(start, end); err != nil {
-			return err
+		if !nonZeroesPresent {
+			if err := m.delete(start, end); err != nil {
+				return err
+			}
 		}
-	}
 
+	}
 	return nil
 }
 
@@ -309,6 +305,7 @@ func listMetrics() ([]metric, error) {
 }
 
 func (m *metric) gatherInfo(start, end time.Time, gatherTags bool) error {
+	fmt.Printf("Gathering info on %s. Start: %s, End: %s\n", m.name, start, end)
 	if m.tagKeys == nil {
 		m.tagKeys = make(map[string]bool)
 	}
