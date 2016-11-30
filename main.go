@@ -115,10 +115,6 @@ func Run(c *cli.Context) error {
 		return err
 	}
 
-	// metrics := make([]metric, 2)
-	// metrics[0] = metric{name: "linux.mem.active"}
-	// metrics[1] = metric{name: "linux.interrupts"}
-
 	for _, r := range config.Rule {
 
 		for _, m := range metrics {
