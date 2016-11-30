@@ -26,6 +26,8 @@ import (
 
 var debug = false
 
+const breadth = time.Hour * 24
+
 var host string
 var now time.Time
 
@@ -116,41 +118,6 @@ func Run(c *cli.Context) error {
 	metrics[0] = metric{name: "linux.mem.active"}
 	metrics[1] = metric{name: "linux.interrupts"}
 
-	err := process(metrics)
-	if err != nil {
-		return err
-	}
-
-	//	for _, m := range metrics {
-	//		err := m.gatherInfo()
-	//		if err != nil {
-	//			return err
-	//		}
-
-	//for t, d := range m.datapointsPerDay {
-
-	//}
-
-	//		for _, tag := range m.tagSets {
-	//			if time.Now().Sub(tag.last) > time.Hour*24*30 {
-	//				fmt.Printf("Tagset %s is very old\n.", tag.set.String())
-	//			}
-	//		}
-
-	//	}
-
-	return nil
-}
-
-type rule struct {
-	Metrics  []string
-	Globs    []glob.Glob
-	Expire   opentsdb.Duration
-	Cooldown opentsdb.Duration
-	ZeroOnly bool
-}
-
-func process(metrics []metric) error {
 	for _, r := range config.Rule {
 
 		for _, m := range metrics {
@@ -165,7 +132,7 @@ func process(metrics []metric) error {
 				continue
 			}
 
-			if err := processIt(m, r); err != nil {
+			if err := process(m, r); err != nil {
 				return err
 			}
 
@@ -176,7 +143,15 @@ func process(metrics []metric) error {
 	return nil
 }
 
-func processIt(m metric, r *rule) error {
+type rule struct {
+	Metrics  []string
+	Globs    []glob.Glob
+	Expire   opentsdb.Duration
+	Cooldown opentsdb.Duration
+	ZeroOnly bool
+}
+
+func process(m metric, r *rule) error {
 
 	lookBack := now.Add(time.Duration(config.LookBack) * -1).Truncate(time.Hour * 24)
 	expire := now.Add(time.Duration(r.Expire) * -1).Truncate(time.Hour * 24)
@@ -208,21 +183,24 @@ func processIt(m metric, r *rule) error {
 	}
 
 	if days[len(days)-1].Before(expire) {
-		fmt.Printf("Deleting datapoints for metric %s. Start: %s, End: %s\n", m.name, start, end)
-		m.delete(start, expire)
+		if r.ZeroOnly {
+			m.deleteZeroOnly(start, expire)
+		} else {
+			m.delete(start, expire)
+		}
 	}
 
 	return nil
 }
 
 func (m metric) delete(start, end time.Time) error {
+	fmt.Printf("Deleting datapoints for metric %s. Start: %s, End: %s\n", m.name, start, end)
 	var query opentsdb.Query
 
 	query.Metric = m.name
 	query.Downsample = "1d-count"
 	query.Aggregator = "sum"
 
-	breadth := time.Hour * 24
 	for ; start.Before(end); start = start.Add(time.Hour * 24) {
 		var request opentsdb.Request
 		request.Start = start.Unix()
@@ -241,6 +219,49 @@ func (m metric) delete(start, end time.Time) error {
 
 	return nil
 
+}
+
+func (m metric) deleteZeroOnly(start, end time.Time) error {
+	queries := make([]*opentsdb.Query, 2)
+	queries[0].Metric = m.name
+	queries[0].Downsample = "1d-max"
+	queries[0].Aggregator = "sum"
+	queries[0].Metric = m.name
+	queries[0].Downsample = "1d-min"
+	queries[0].Aggregator = "sum"
+
+	nonZeroesPresent := false
+	for start := start; start.Before(end); start = start.Add(time.Hour * 24) {
+		var request opentsdb.Request
+		request.Start = start.Unix()
+		request.End = start.Add(breadth).Unix()
+		request.Queries = queries
+
+		if debug {
+			fmt.Println(request)
+		}
+		resp, err := request.Query(host)
+		if err != nil {
+			return err
+		}
+
+		for _, r := range resp {
+			for _, d := range r.DPS {
+				if d != 0 {
+					nonZeroesPresent = true
+					break
+				}
+			}
+		}
+
+	}
+	if !nonZeroesPresent {
+		if err := m.delete(start, end); err != nil {
+			return err
+		}
+	}
+
+	return nil
 }
 
 // sortedDays returns a sorted list of time.Times representing days that this
@@ -304,7 +325,6 @@ func (m *metric) gatherInfo(start, end time.Time, gatherTags bool) error {
 	query.Downsample = "1d-count"
 	query.Aggregator = "sum"
 
-	breadth := time.Hour * 24
 	for ; start.Before(end); start = start.Add(time.Hour * 24) {
 		var request opentsdb.Request
 		request.Start = start.Unix()
@@ -452,10 +472,4 @@ type tagSet struct {
 	first            time.Time
 	last             time.Time
 	datapointsPerDay map[time.Time]int64
-}
-
-// Deletes rows containing nothing but 0 values.
-func deleteZeroValues(m metric) error {
-
-	return nil
 }
