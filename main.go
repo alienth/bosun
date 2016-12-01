@@ -26,7 +26,7 @@ import (
 
 var debug = false
 
-const breadth = time.Hour * 24
+const breadth = time.Hour * 6
 
 var host string
 var now = time.Now()
@@ -353,11 +353,7 @@ func (m *metric) gatherInfo(start, end time.Time, gatherTags bool) error {
 					m.first = t
 				}
 
-				// Since we're aggregating by 1d, this should
-				// always effectively be a noop.
-				t = t.Truncate(time.Hour * 24)
-
-				m.datapointsPerDay[t] += int64(d)
+				m.datapointsPerDay[t.Truncate(time.Hour*24)] += int64(d)
 			}
 
 			for _, k := range r.AggregateTags {
@@ -439,11 +435,7 @@ func (m *metric) gatherTagSets(start, end time.Time) error {
 				tags.first = t
 			}
 
-			// Since we're aggregating by 1d, this should
-			// always effectively be a noop.
-			t = t.Truncate(time.Hour * 24)
-
-			tags.datapointsPerDay[t] += int64(d)
+			tags.datapointsPerDay[t.Truncate(time.Hour*24)] += int64(d)
 		}
 
 	}
