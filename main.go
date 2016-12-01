@@ -29,10 +29,9 @@ var debug = false
 const breadth = time.Hour * 24
 
 var host string
-var now time.Time
+var now = time.Now()
 
 func main() {
-	now = time.Now()
 	app := cli.NewApp()
 	app.Name = "tsdb-expire"
 
@@ -166,6 +165,11 @@ func process(m metric, r *rule) error {
 
 	m.gatherInfo(start, end, false)
 
+	if len(m.datapointsPerDay) == 0 {
+		fmt.Printf("No datapoints found for %s between %s and %s.\n", m.name, start, end)
+		return nil
+	}
+
 	days := m.sortedDays(true)
 	if days[0].After(cooldown) {
 		dataWithinCooldown = true
@@ -176,9 +180,13 @@ func process(m metric, r *rule) error {
 
 	if days[len(days)-1].Before(expire) {
 		if r.ZeroOnly {
-			m.deleteZeroOnly(start, expire)
+			if err := m.deleteZeroOnly(start, expire); err != nil {
+				return err
+			}
 		} else {
-			m.delete(start, expire)
+			if err := m.delete(start, expire); err != nil {
+				return err
+			}
 		}
 	}
 
