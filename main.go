@@ -178,13 +178,18 @@ func process(m metric, r *rule) error {
 		fmt.Printf("%s has data within cooldown. Ignoring\n", m.name)
 	}
 
-	if days[len(days)-1].Before(expire) {
+	deleteStart := days[len(days)-1]
+	deleteEnd := expire
+	if days[0].Before(expire) {
+		deleteEnd = days[0]
+	}
+	if deleteStart.Before(expire) {
 		if r.ZeroOnly {
-			if err := m.deleteZeroOnly(start, expire); err != nil {
+			if err := m.deleteZeroOnly(deleteStart, deleteEnd); err != nil {
 				return err
 			}
 		} else {
-			if err := m.delete(start, expire); err != nil {
+			if err := m.delete(deleteStart, deleteEnd); err != nil {
 				return err
 			}
 		}
@@ -201,7 +206,7 @@ func (m metric) delete(start, end time.Time) error {
 	query.Downsample = "1d-count"
 	query.Aggregator = "sum"
 
-	for ; start.Before(end); start = start.Add(time.Hour * 24) {
+	for ; start.Before(end); start = start.Add(breadth) {
 		var request opentsdb.Request
 		request.Start = start.Unix()
 		request.End = start.Add(breadth).Unix()
@@ -231,7 +236,7 @@ func (m metric) deleteZeroOnly(start, end time.Time) error {
 	queries[1].Downsample = "1d-min"
 	queries[1].Aggregator = "sum"
 
-	for ; start.Before(end); start = start.Add(time.Hour * 24) {
+	for ; start.Before(end); start = start.Add(breadth) {
 		var request opentsdb.Request
 		request.Start = start.Unix()
 		request.End = start.Add(breadth).Unix()
@@ -326,7 +331,7 @@ func (m *metric) gatherInfo(start, end time.Time, gatherTags bool) error {
 	query.Downsample = "1d-count"
 	query.Aggregator = "sum"
 
-	for ; start.Before(end); start = start.Add(time.Hour * 24) {
+	for ; start.Before(end); start = start.Add(breadth) {
 		var request opentsdb.Request
 		request.Start = start.Unix()
 		request.End = start.Add(breadth).Unix()
